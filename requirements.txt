@@ -1,0 +1,11 @@
+# OBS Zoom to Mouse - Python Edition
+# Required dependencies
+pynput>=1.7.6           # Cross-platform mouse tracking
+screeninfo>=0.8.1       # Display information
+
+# Optional dependencies
+websockets>=12.0        # WebSocket server for remote control (optional)
+
+# macOS only (optional, for better Retina detection)
+# pyobjc-framework-Cocoa
+

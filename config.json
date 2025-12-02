@@ -1,0 +1,46 @@
+{
+  "version": "2.0.0",
+  "default_profile": "standard",
+  "profiles": {
+    "standard": {
+      "zoom_factor": 2.0,
+      "zoom_speed": 0.06,
+      "follow_speed": 0.25,
+      "follow_border": 8,
+      "follow_safezone_sensitivity": 4,
+      "easing": "ease_in_out",
+      "auto_follow": true,
+      "follow_outside_bounds": false,
+      "auto_lock_on_reverse": false
+    },
+    "presentation": {
+      "zoom_factor": 3.0,
+      "zoom_speed": 0.1,
+      "follow_speed": 0.3,
+      "follow_border": 15,
+      "follow_safezone_sensitivity": 6,
+      "easing": "ease_in_out",
+      "auto_follow": true,
+      "follow_outside_bounds": false,
+      "auto_lock_on_reverse": false
+    },
+    "quick": {
+      "zoom_factor": 2.5,
+      "zoom_speed": 0.15,
+      "follow_speed": 0.4,
+      "follow_border": 10,
+      "follow_safezone_sensitivity": 4,
+      "easing": "ease_out",
+      "auto_follow": true,
+      "follow_outside_bounds": true,
+      "auto_lock_on_reverse": true
+    }
+  },
+  "websocket": {
+    "enabled": false,
+    "port": 8765
+  },
+  "display_overrides": {},
+  "debug_logging": false
+}
+
