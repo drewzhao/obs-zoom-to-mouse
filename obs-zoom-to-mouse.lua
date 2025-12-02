@@ -6,7 +6,7 @@
 
 local obs = obslua
 local ffi = require("ffi")
-local VERSION = "1.0.2"
+local VERSION = "1.1.0"
 local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 
 local socket_available, socket = pcall(require, "ljsocket")
@@ -83,9 +83,19 @@ local ZoomState = {
 local zoom_state = ZoomState.None
 
 local version = obs.obs_get_version_string()
-local m1, m2 = version:match("(%d+%.%d+)%.(%d+)")
-local major = tonumber(m1) or 0
-local minor = tonumber(m2) or 0
+local major_str, minor_str, patch_str = version:match("(%d+)%.(%d+)%.(%d+)")
+local obs_major = tonumber(major_str) or 0
+local obs_minor = tonumber(minor_str) or 0
+local obs_patch = tonumber(patch_str) or 0
+
+-- Helper function for version comparison
+local function obs_version_at_least(maj, min, pat)
+    if obs_major > maj then return true end
+    if obs_major < maj then return false end
+    if obs_minor > min then return true end
+    if obs_minor < min then return false end
+    return obs_patch >= (pat or 0)
+end
 
 -- Define the mouse cursor functions for each platform
 if ffi.os == "Windows" then
@@ -205,25 +215,26 @@ function get_dc_info()
             prop_type = "string"
         }
     elseif ffi.os == "Linux" then
+        -- pipewire-screen-capture-source is the modern Wayland-compatible option
+        -- xshm_input_v2 is the updated X11 version
+        -- xshm_input is obsolete but kept for backward compatibility
         return {
-            source_id = "xshm_input",
+            source_id = "pipewire-screen-capture-source",
+            source_id_fallback = "xshm_input_v2",
+            source_id_legacy = "xshm_input",
             prop_id = "screen",
             prop_type = "int"
         }
     elseif ffi.os == "OSX" then
-        if major > 29.0 then
-            return {
-                source_id = "screen_capture",
-                prop_id = "display_uuid",
-                prop_type = "string"
-            }
-        else
-            return {
-                source_id = "display_capture",
-                prop_id = "display",
-                prop_type = "int"
-            }
-        end
+        -- screen_capture available since OBS 28.1 with macOS 12.5+ (ScreenCaptureKit)
+        -- display_capture deprecated on macOS 13.0+
+        -- Both use display_uuid (string) in modern OBS versions
+        return {
+            source_id = "screen_capture",
+            source_id_fallback = "display_capture",
+            prop_id = "display_uuid",
+            prop_type = "string"
+        }
     end
 
     return nil
@@ -404,7 +415,12 @@ function is_display_capture(source_to_check)
             -- Do a quick check to ensure this is a display capture
             if allow_all_sources then
                 local source_type = obs.obs_source_get_id(source_to_check)
+                -- Check primary, fallback, and legacy source IDs
                 if source_type == dc_info.source_id then
+                    return true
+                elseif dc_info.source_id_fallback and source_type == dc_info.source_id_fallback then
+                    return true
+                elseif dc_info.source_id_legacy and source_type == dc_info.source_id_legacy then
                     return true
                 end
             else
@@ -448,7 +464,7 @@ function release_sceneitem()
 
         if sceneitem_info_orig ~= nil then
             log("Transform info reset back to original")
-            obs.obs_sceneitem_get_info(sceneitem, sceneitem_info_orig)
+            obs.obs_sceneitem_set_info2(sceneitem, sceneitem_info_orig)
             sceneitem_info_orig = nil
         end
 
@@ -499,48 +515,13 @@ function refresh_sceneitem(find_newest)
                 -- Get the current scene
                 local scene_source = obs.obs_frontend_get_current_scene()
                 if scene_source ~= nil then
-                    local function find_scene_item_by_name(root_scene)
-                        local queue = {}
-                        table.insert(queue, root_scene)
-
-                        while #queue > 0 do
-                            local s = table.remove(queue, 1)
-                            log("Looking in scene '" .. obs.obs_source_get_name(obs.obs_scene_get_source(s)) .. "'")
-
-                            -- Check if the current scene has the target scene item
-                            local found = obs.obs_scene_find_source(s, source_name)
-                            if found ~= nil then
-                                log("Found sceneitem '" .. source_name .. "'")
-                                obs.obs_sceneitem_addref(found)
-                                return found
-                            end
-
-                            -- If the current scene has nested scenes, enqueue them for later examination
-                            local all_items = obs.obs_scene_enum_items(s)
-                            if all_items then
-                                for _, item in pairs(all_items) do
-                                    local nested = obs.obs_sceneitem_get_source(item)
-                                    if nested ~= nil then
-                                        if obs.obs_source_is_scene(nested) then
-                                            local nested_scene = obs.obs_scene_from_source(nested)
-                                            table.insert(queue, nested_scene)
-                                        elseif obs.obs_source_is_group(nested) then
-                                            local nested_scene = obs.obs_group_from_source(nested)
-                                            table.insert(queue, nested_scene)
-                                        end
-                                    end
-                                end
-                                obs.sceneitem_list_release(all_items)
-                            end
-                        end
-
-                        return nil
-                    end
-
-                    -- Find the sceneitem for the source_name by looking through all the items
-                    -- We start at the current scene and use a BFS to look into any nested scenes
+                    -- Use OBS's built-in recursive search which handles nested scenes and groups
                     local current = obs.obs_scene_from_source(scene_source)
-                    sceneitem = find_scene_item_by_name(current)
+                    sceneitem = obs.obs_scene_find_source_recursive(current, source_name)
+                    if sceneitem ~= nil then
+                        log("Found sceneitem '" .. source_name .. "'")
+                        obs.obs_sceneitem_addref(sceneitem)
+                    end
 
                     obs.obs_source_release(scene_source)
                 end
@@ -574,13 +555,13 @@ function refresh_sceneitem(find_newest)
     if sceneitem ~= nil then
         -- Capture the original settings so we can restore them later
         sceneitem_info_orig = obs.obs_transform_info()
-        obs.obs_sceneitem_get_info(sceneitem, sceneitem_info_orig)
+        obs.obs_sceneitem_get_info2(sceneitem, sceneitem_info_orig)
 
         sceneitem_crop_orig = obs.obs_sceneitem_crop()
         obs.obs_sceneitem_get_crop(sceneitem, sceneitem_crop_orig)
 
         sceneitem_info = obs.obs_transform_info()
-        obs.obs_sceneitem_get_info(sceneitem, sceneitem_info)
+        obs.obs_sceneitem_get_info2(sceneitem, sceneitem_info)
 
         sceneitem_crop = obs.obs_sceneitem_crop()
         obs.obs_sceneitem_get_crop(sceneitem, sceneitem_crop)
@@ -631,7 +612,7 @@ function refresh_sceneitem(find_newest)
             sceneitem_info.bounds.x = source_width * sceneitem_info.scale.x
             sceneitem_info.bounds.y = source_height * sceneitem_info.scale.y
 
-            obs.obs_sceneitem_set_info(sceneitem, sceneitem_info)
+            obs.obs_sceneitem_set_info2(sceneitem, sceneitem_info)
 
             log("WARNING: Found existing non-boundingbox transform. This may cause issues with zooming.\n" ..
                 "         Settings have been auto converted to a bounding box scaling transfrom instead.\n" ..
@@ -1054,13 +1035,21 @@ end
 
 function set_crop_settings(crop)
     if crop_filter ~= nil and crop_filter_settings ~= nil then
+        -- Use deferred updates for better performance when making multiple changes
+        if sceneitem ~= nil then
+            obs.obs_sceneitem_defer_update_begin(sceneitem)
+        end
+
         -- Call into OBS to update our crop filter with the new settings
-        -- I have no idea how slow/expensive this is, so we could potentially only do it if something changes
         obs.obs_data_set_int(crop_filter_settings, "left", math.floor(crop.x))
         obs.obs_data_set_int(crop_filter_settings, "top", math.floor(crop.y))
         obs.obs_data_set_int(crop_filter_settings, "cx", math.floor(crop.w))
         obs.obs_data_set_int(crop_filter_settings, "cy", math.floor(crop.h))
         obs.obs_source_update(crop_filter, crop_filter_settings)
+
+        if sceneitem ~= nil then
+            obs.obs_sceneitem_defer_update_end(sceneitem)
+        end
     end
 end
 
@@ -1167,7 +1156,7 @@ function log_current_settings()
         version = VERSION
     }
 
-    log("OBS Version: " .. string.format("%.1f", major) .. "." .. minor)
+    log("OBS Version: " .. obs_major .. "." .. obs_minor .. "." .. obs_patch)
     log("Platform: " .. ffi.os)
     log("Current settings:")
     log(format_table(settings))
@@ -1406,7 +1395,7 @@ function script_unload()
     is_script_loaded = false
 
     -- Clean up the memory usage
-    if major > 29.1 or (major == 29.1 and minor > 2) then -- 29.1.2 and below seems to crash if you do this, so we ignore it as the script is closing anyway
+    if obs_version_at_least(29, 1, 3) then -- 29.1.2 and below seems to crash if you do this, so we ignore it as the script is closing anyway
         local transitions = obs.obs_frontend_get_transitions()
         if transitions ~= nil then
             for i, s in pairs(transitions) do
@@ -1556,7 +1545,16 @@ function populate_zoom_sources(list)
         obs.obs_property_list_add_string(list, "<None>", "obs-zoom-to-mouse-none")
         for _, source in ipairs(sources) do
             local source_type = obs.obs_source_get_id(source)
-            if source_type == dc_info.source_id or allow_all_sources then
+            -- Check primary, fallback, and legacy source IDs
+            local is_display_source = source_type == dc_info.source_id
+            if not is_display_source and dc_info.source_id_fallback then
+                is_display_source = source_type == dc_info.source_id_fallback
+            end
+            if not is_display_source and dc_info.source_id_legacy then
+                is_display_source = source_type == dc_info.source_id_legacy
+            end
+
+            if is_display_source or allow_all_sources then
                 local name = obs.obs_source_get_name(source)
                 obs.obs_property_list_add_string(list, name, name)
             end
