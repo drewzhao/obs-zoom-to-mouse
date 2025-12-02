@@ -6,7 +6,7 @@
 
 local obs = obslua
 local ffi = require("ffi")
-local VERSION = "1.1.0"
+local VERSION = "1.1.1"
 local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 
 local socket_available, socket = pcall(require, "ljsocket")
@@ -542,6 +542,29 @@ function refresh_sceneitem(find_newest)
 
     if not monitor_info then
         monitor_info = get_monitor_info(source)
+    end
+
+    -- Auto-detect Retina backing scale factor on macOS
+    -- The display name shows points (e.g., 1440x900) but the source captures pixels (e.g., 2880x1800)
+    -- NSEvent mouseLocation returns points, so we need to scale mouse coordinates to match pixel dimensions
+    if ffi.os == "OSX" and not use_monitor_override and monitor_info and source_raw.width > 0 and source_raw.height > 0 then
+        if monitor_info.width > 0 and monitor_info.height > 0 then
+            local detected_scale_x = source_raw.width / monitor_info.width
+            local detected_scale_y = source_raw.height / monitor_info.height
+
+            -- Only apply if scale is reasonable (1x to 3x range covers standard and Retina displays)
+            if detected_scale_x >= 1 and detected_scale_x <= 3 and detected_scale_y >= 1 and detected_scale_y <= 3 then
+                -- Round to nearest 0.5 to handle slight variations
+                monitor_info.scale_x = math.floor(detected_scale_x * 2 + 0.5) / 2
+                monitor_info.scale_y = math.floor(detected_scale_y * 2 + 0.5) / 2
+
+                if monitor_info.scale_x ~= 1 or monitor_info.scale_y ~= 1 then
+                    log("Detected Retina backing scale factor: " .. monitor_info.scale_x .. "x" .. monitor_info.scale_y ..
+                        " (source: " .. source_raw.width .. "x" .. source_raw.height ..
+                        ", display: " .. monitor_info.width .. "x" .. monitor_info.height .. ")")
+                end
+            end
+        end
     end
 
     local is_non_display_capture = not is_display_capture(source)
@@ -1160,6 +1183,11 @@ function log_current_settings()
     log("Platform: " .. ffi.os)
     log("Current settings:")
     log(format_table(settings))
+
+    if monitor_info then
+        log("Monitor info (auto-detected or override):")
+        log(format_table(monitor_info))
+    end
 end
 
 function on_print_help()
