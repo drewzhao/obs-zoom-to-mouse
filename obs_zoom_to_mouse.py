@@ -30,10 +30,11 @@ from zoom_core import (
     ConfigManager,
     ZoomProfile,
 )
+from zoom_core.display_manager import get_macos_backing_scale_factor
 from zoom_core.websocket_server import WebSocketServer, SimpleUDPServer
 
 # Version
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 
 # Global state
@@ -299,7 +300,7 @@ def refresh_sceneitem(find_newest=False):
     
     log(f"Source size: {source_width}x{source_height}")
     
-    # Auto-detect Retina scale on macOS
+    # Auto-detect Retina/HiDPI scale
     scale_x = 1.0
     scale_y = 1.0
     display_x = 0
@@ -309,17 +310,34 @@ def refresh_sceneitem(find_newest=False):
         display_x = monitor_info.get('x', 0)
         display_y = monitor_info.get('y', 0)
         
-        # Calculate scale from source vs display dimensions
-        if monitor_info['width'] > 0 and monitor_info['height'] > 0:
-            detected_scale_x = source_width / monitor_info['width']
-            detected_scale_y = source_height / monitor_info['height']
-            
-            if 1.0 <= detected_scale_x <= 3.0 and 1.0 <= detected_scale_y <= 3.0:
-                scale_x = round(detected_scale_x * 2) / 2
-                scale_y = round(detected_scale_y * 2) / 2
+        # Method 1: Direct backing scale detection on macOS
+        # This is the most reliable method - directly queries NSScreen.backingScaleFactor()
+        if sys.platform == 'darwin':
+            backing_scale = get_macos_backing_scale_factor()
+            if backing_scale > 1.0:
+                scale_x = backing_scale
+                scale_y = backing_scale
+                log(f"macOS direct backing scale: {backing_scale}")
+        
+        # Method 2: Fallback - Calculate scale from source vs display dimensions
+        # On macOS, OBS display name shows dimensions in points (e.g., 2560x1440)
+        # but the source captures in pixels (e.g., 5120x2880)
+        # So: scale = source_pixels / display_points
+        if scale_x == 1.0 and scale_y == 1.0:
+            if monitor_info['width'] > 0 and monitor_info['height'] > 0:
+                detected_scale_x = source_width / monitor_info['width']
+                detected_scale_y = source_height / monitor_info['height']
                 
-                if scale_x != 1.0 or scale_y != 1.0:
-                    log(f"Detected Retina scale: {scale_x}x{scale_y}")
+                if 1.0 < detected_scale_x <= 3.0 and 1.0 < detected_scale_y <= 3.0:
+                    scale_x = round(detected_scale_x * 2) / 2
+                    scale_y = round(detected_scale_y * 2) / 2
+                    
+                    log(f"Fallback scale detection: {scale_x}x{scale_y} "
+                        f"(source: {source_width}x{source_height}, "
+                        f"display: {monitor_info['width']}x{monitor_info['height']})")
+    
+    if scale_x != 1.0 or scale_y != 1.0:
+        log(f"Using Retina/HiDPI scale: {scale_x}x{scale_y}")
     
     # Save original transform
     sceneitem_info_orig = obs.obs_transform_info()

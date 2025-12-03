@@ -143,7 +143,30 @@ class DisplayManager:
                 from Quartz import CGDisplayCreateUUIDFromDisplayID, CFUUIDCreateString
                 import CoreFoundation
                 
-                for i, screen in enumerate(NSScreen.screens()):
+                # First, calculate the total height for Y-coordinate conversion
+                # macOS uses bottom-left origin, but we need top-left origin
+                # to match pynput/CGEvent coordinate system
+                all_screens = NSScreen.screens()
+                
+                # Find the coordinate space bounds
+                # The primary display (index 0) has origin at (0, 0) in macOS coords
+                # but other displays may have negative or positive Y values
+                min_y = 0
+                max_y = 0
+                primary_height = 0
+                
+                for i, screen in enumerate(all_screens):
+                    frame = screen.frame()
+                    screen_bottom = frame.origin.y
+                    screen_top = frame.origin.y + frame.size.height
+                    
+                    if i == 0:
+                        primary_height = frame.size.height
+                    
+                    min_y = min(min_y, screen_bottom)
+                    max_y = max(max_y, screen_top)
+                
+                for i, screen in enumerate(all_screens):
                     frame = screen.frame()
                     backing_scale = screen.backingScaleFactor()
                     
@@ -163,12 +186,31 @@ class DisplayManager:
                     # Get localized name
                     name = screen.localizedName() if hasattr(screen, 'localizedName') else f"Display {i+1}"
                     
+                    # Convert Y coordinate from macOS bottom-left origin to top-left origin
+                    # In macOS: Y=0 is at bottom of primary display, Y increases upward
+                    # In pynput/standard: Y=0 is at top of primary display, Y increases downward
+                    # 
+                    # For the primary display (0,0 in macOS coords with height H):
+                    #   - macOS: origin.y = 0, top of display is at Y = H
+                    #   - Standard: origin.y = 0, bottom of display is at Y = H
+                    # 
+                    # Conversion: standard_y = primary_height - (macos_y + screen_height)
+                    # This places the top of the screen at the correct Y position
+                    macos_y = frame.origin.y
+                    screen_height = frame.size.height
+                    
+                    # Convert: the TOP of this screen in standard coords
+                    # In macOS, the TOP of the screen is at macos_y + screen_height
+                    # In standard coords (top-left origin), Y=0 is at the TOP of primary
+                    # So: standard_top = primary_height - (macos_y + screen_height)
+                    # But we want the top-left corner, which is just the top position
+                    standard_y = int(primary_height - (macos_y + screen_height))
+                    
                     display = DisplayInfo(
                         id=str(screen_number),
                         name=name,
                         x=int(frame.origin.x),
-                        # macOS has inverted Y (0 at bottom)
-                        y=int(frame.origin.y),
+                        y=standard_y,  # Converted to top-left origin
                         width=int(frame.size.width),
                         height=int(frame.size.height),
                         width_px=int(frame.size.width * backing_scale),
@@ -372,4 +414,56 @@ def get_display_manager() -> DisplayManager:
     if _global_manager is None:
         _global_manager = DisplayManager()
     return _global_manager
+
+
+def get_macos_backing_scale_factor() -> float:
+    """
+    Get the macOS backing scale factor for the main screen.
+    
+    This directly queries NSScreen.mainScreen().backingScaleFactor()
+    to get the Retina scale factor.
+    
+    Returns:
+        Scale factor (2.0 for Retina, 1.0 for non-Retina)
+    """
+    if sys.platform != 'darwin':
+        return 1.0
+    
+    try:
+        from AppKit import NSScreen
+        main_screen = NSScreen.mainScreen()
+        if main_screen:
+            return main_screen.backingScaleFactor()
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    return 1.0
+
+
+def get_macos_display_height_in_points() -> int:
+    """
+    Get the primary display height in points (for Y-coordinate calculations).
+    
+    On macOS, mouse coordinates from pynput are in points with top-left origin.
+    This function returns the primary display height in points.
+    
+    Returns:
+        Display height in points
+    """
+    if sys.platform != 'darwin':
+        return 0
+    
+    try:
+        from AppKit import NSScreen
+        main_screen = NSScreen.mainScreen()
+        if main_screen:
+            return int(main_screen.frame().size.height)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    return 0
 

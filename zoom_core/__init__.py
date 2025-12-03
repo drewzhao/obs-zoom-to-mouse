@@ -4,7 +4,12 @@ Cross-platform zoom functionality for OBS Studio
 """
 
 from .mouse_tracker import MouseTracker
-from .display_manager import DisplayManager, DisplayInfo
+from .display_manager import (
+    DisplayManager, 
+    DisplayInfo,
+    get_macos_backing_scale_factor,
+    get_macos_display_height_in_points,
+)
 from .zoom_controller import ZoomController, ZoomState, CropRect
 from .config_manager import ConfigManager, ZoomProfile, Config
 from .easing import EASING_FUNCTIONS, lerp, get_easing, clamp
@@ -17,6 +22,8 @@ __all__ = [
     # Display management
     'DisplayManager',
     'DisplayInfo',
+    'get_macos_backing_scale_factor',
+    'get_macos_display_height_in_points',
     
     # Zoom control
     'ZoomController',
@@ -40,5 +47,5 @@ __all__ = [
     'SimpleStateIndicator',
 ]
 
-__version__ = '2.0.0'
+__version__ = '2.1.0'
 
