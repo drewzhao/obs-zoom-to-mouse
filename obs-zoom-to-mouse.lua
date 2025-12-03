@@ -6,7 +6,7 @@
 
 local obs = obslua
 local ffi = require("ffi")
-local VERSION = "1.1.1"
+local VERSION = "1.2.0"
 local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 
 local socket_available, socket = pcall(require, "ljsocket")
@@ -47,6 +47,11 @@ local x11_mouse = nil
 local osx_lib = nil
 local osx_nsevent = nil
 local osx_mouse_location = nil
+local osx_nsscreen_class = nil
+local osx_mainScreen_sel = nil
+local osx_backingScaleFactor_sel = nil
+local osx_msgSend = nil
+local osx_msgSend_fpret = nil
 
 local use_auto_follow_mouse = true
 local use_follow_outside_bounds = false
@@ -134,6 +139,7 @@ elseif ffi.os == "Linux" then
         }
     end
 elseif ffi.os == "OSX" then
+    -- Base declarations for macOS
     ffi.cdef([[
         typedef struct {
             double x;
@@ -148,7 +154,17 @@ elseif ffi.os == "OSX" then
         Method class_getClassMethod(id cls, SEL name);
         void* method_getImplementation(Method);
         int access(const char *path, int amode);
+
+        // objc_msgSend for calling Objective-C methods
+        id objc_msgSend(id self, SEL op, ...);
     ]])
+
+    -- objc_msgSend_fpret only exists on x86_64, not on ARM64
+    if ffi.arch == "x64" then
+        ffi.cdef([[
+            double objc_msgSend_fpret(id self, SEL op, ...);
+        ]])
+    end
 
     osx_lib = ffi.load("libobjc")
     if osx_lib ~= nil then
@@ -160,6 +176,15 @@ elseif ffi.os == "OSX" then
         if method ~= nil then
             local imp = osx_lib.method_getImplementation(method)
             osx_mouse_location = ffi.cast("CGPoint(*)(void*, void*)", imp)
+        end
+
+        -- Setup for getting backing scale factor from NSScreen
+        osx_nsscreen_class = osx_lib.objc_getClass("NSScreen")
+        osx_mainScreen_sel = osx_lib.sel_registerName("mainScreen")
+        osx_backingScaleFactor_sel = osx_lib.sel_registerName("backingScaleFactor")
+        osx_msgSend = osx_lib.objc_msgSend
+        if ffi.arch == "x64" then
+            osx_msgSend_fpret = osx_lib.objc_msgSend_fpret
         end
     end
 end
@@ -202,6 +227,40 @@ function get_mouse_pos()
     end
 
     return mouse
+end
+
+---
+-- Get the macOS backing scale factor (Retina scaling)
+-- Returns the scale factor for the main screen (typically 2.0 for Retina, 1.0 for non-Retina)
+---@return number scale The backing scale factor
+function get_osx_backing_scale_factor()
+    if ffi.os ~= "OSX" then
+        return 1.0
+    end
+
+    if osx_lib == nil or osx_nsscreen_class == nil or osx_mainScreen_sel == nil or osx_backingScaleFactor_sel == nil then
+        return 1.0
+    end
+
+    -- Call [NSScreen mainScreen]
+    local mainScreen = osx_msgSend(osx_nsscreen_class, osx_mainScreen_sel)
+    if mainScreen == nil then
+        return 1.0
+    end
+
+    -- Call [mainScreen backingScaleFactor]
+    -- On x86_64 macOS, objc_msgSend_fpret is used for methods returning floating point
+    -- On ARM64, regular objc_msgSend works for all types
+    local scale = 1.0
+    if ffi.arch == "x64" then
+        scale = osx_msgSend_fpret(mainScreen, osx_backingScaleFactor_sel)
+    else
+        -- For ARM64, cast objc_msgSend to return double
+        local msgSend_double = ffi.cast("double(*)(void*, void*)", osx_msgSend)
+        scale = msgSend_double(mainScreen, osx_backingScaleFactor_sel)
+    end
+
+    return scale
 end
 
 ---
@@ -368,6 +427,26 @@ function get_monitor_info(source)
                         info.scale_y = 1
                         info.display_width = info.width
                         info.display_height = info.height
+
+                        -- On macOS, get the actual backing scale factor directly from the system
+                        -- IMPORTANT: On macOS, the display name already reports dimensions in POINTS (not pixels)
+                        -- e.g., a 5K Retina display shows "2560x1440" in the display name
+                        -- NSEvent.mouseLocation also returns coordinates in POINTS
+                        -- So display_width/height should stay as-is (they're already in points)
+                        -- But we need scale_x/scale_y to convert mouse points → source pixels
+                        if ffi.os == "OSX" then
+                            local backing_scale = get_osx_backing_scale_factor()
+                            if backing_scale > 1 then
+                                info.scale_x = backing_scale
+                                info.scale_y = backing_scale
+                                -- display_width/height stay the same as width/height (both in points)
+                                -- This is correct because NSEvent.mouseLocation is also in points
+                                info.display_width = info.width
+                                info.display_height = info.height
+                                log("macOS Retina detected: backing scale factor = " .. backing_scale ..
+                                    " (display dimensions in points: " .. info.width .. "x" .. info.height .. ")")
+                            end
+                        end
 
                         log("Parsed the following display information\n" .. format_table(info))
 
@@ -544,24 +623,30 @@ function refresh_sceneitem(find_newest)
         monitor_info = get_monitor_info(source)
     end
 
-    -- Auto-detect Retina backing scale factor on macOS
-    -- The display name shows points (e.g., 1440x900) but the source captures pixels (e.g., 2880x1800)
-    -- NSEvent mouseLocation returns points, so we need to scale mouse coordinates to match pixel dimensions
+    -- Fallback Retina detection: if direct backing scale detection didn't work (scale is still 1.0),
+    -- try to infer it by comparing source dimensions (pixels) with display name dimensions (points on macOS)
+    -- This is less reliable but provides a fallback for edge cases
     if ffi.os == "OSX" and not use_monitor_override and monitor_info and source_raw.width > 0 and source_raw.height > 0 then
-        if monitor_info.width > 0 and monitor_info.height > 0 then
-            local detected_scale_x = source_raw.width / monitor_info.width
-            local detected_scale_y = source_raw.height / monitor_info.height
+        -- Only apply fallback if scale wasn't already detected
+        if monitor_info.scale_x == 1 and monitor_info.scale_y == 1 then
+            if monitor_info.width > 0 and monitor_info.height > 0 then
+                -- source_raw is in pixels, monitor_info.width/height are in points (on macOS)
+                local detected_scale_x = source_raw.width / monitor_info.width
+                local detected_scale_y = source_raw.height / monitor_info.height
 
-            -- Only apply if scale is reasonable (1x to 3x range covers standard and Retina displays)
-            if detected_scale_x >= 1 and detected_scale_x <= 3 and detected_scale_y >= 1 and detected_scale_y <= 3 then
-                -- Round to nearest 0.5 to handle slight variations
-                monitor_info.scale_x = math.floor(detected_scale_x * 2 + 0.5) / 2
-                monitor_info.scale_y = math.floor(detected_scale_y * 2 + 0.5) / 2
+                -- Only apply if scale is reasonable (1x to 3x range covers standard and Retina displays)
+                if detected_scale_x > 1 and detected_scale_x <= 3 and detected_scale_y > 1 and detected_scale_y <= 3 then
+                    -- Round to nearest 0.5 to handle slight variations
+                    monitor_info.scale_x = math.floor(detected_scale_x * 2 + 0.5) / 2
+                    monitor_info.scale_y = math.floor(detected_scale_y * 2 + 0.5) / 2
+                    -- display_width/height should stay the same (already in points, matching NSEvent.mouseLocation)
+                    -- DO NOT divide by scale - that was the bug!
+                    monitor_info.display_width = monitor_info.width
+                    monitor_info.display_height = monitor_info.height
 
-                if monitor_info.scale_x ~= 1 or monitor_info.scale_y ~= 1 then
-                    log("Detected Retina backing scale factor: " .. monitor_info.scale_x .. "x" .. monitor_info.scale_y ..
-                        " (source: " .. source_raw.width .. "x" .. source_raw.height ..
-                        ", display: " .. monitor_info.width .. "x" .. monitor_info.height .. ")")
+                    log("Fallback Retina detection: scale = " .. monitor_info.scale_x .. "x" .. monitor_info.scale_y ..
+                        " (source pixels: " .. source_raw.width .. "x" .. source_raw.height ..
+                        ", display points: " .. monitor_info.width .. "x" .. monitor_info.height .. ")")
                 end
             end
         end
