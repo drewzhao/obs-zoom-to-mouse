@@ -1,11 +1,33 @@
-# OBS Zoom to Mouse - Python Edition
+# OBS Zoom to Mouse - Python Edition v2.1.0
+# 
+# Python version: 3.8 - 3.11 recommended (matches OBS Studio's scripting support)
+# Python 3.12+ may work on Linux but is not officially tested with OBS
+
+# =============================================================================
 # Required dependencies
-pynput>=1.7.6           # Cross-platform mouse tracking
-screeninfo>=0.8.1       # Display information
+# =============================================================================
+pynput>=1.7.6               # Cross-platform mouse tracking (handles Y-flip on macOS)
+screeninfo>=0.8.1           # Display information fallback
 
+# =============================================================================
 # Optional dependencies
-websockets>=12.0        # WebSocket server for remote control (optional)
+# =============================================================================
+websockets>=12.0            # WebSocket server for remote control
 
-# macOS only (optional, for better Retina detection)
-# pyobjc-framework-Cocoa
+# =============================================================================
+# macOS only - RECOMMENDED for proper Retina display support
+# =============================================================================
+# These packages enable:
+#   - Direct NSScreen.backingScaleFactor() detection (more reliable)
+#   - Proper multi-monitor coordinate handling
+#   - Display UUID detection for OBS source matching
+#
+# Install with: pip install pyobjc-framework-Quartz>=10.0
+# (This automatically installs pyobjc-framework-Cocoa as a dependency)
+#
+# pyobjc-framework-Quartz>=10.0   # Includes Quartz and Cocoa frameworks
+#
+# Or install individually:
+# pyobjc-framework-Cocoa>=10.0    # NSScreen, AppKit
+# pyobjc-framework-Quartz>=10.0   # CGDisplay, CGEvent
 
