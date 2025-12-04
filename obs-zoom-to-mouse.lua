@@ -79,6 +79,16 @@ local debug_logs = false
 local is_obs_loaded = false
 local is_script_loaded = false
 
+local RetinaMode = {
+    Auto = "auto",
+    ForcePoints = "force_points",
+    ForcePixels = "force_pixels",
+}
+
+local retina_mode = RetinaMode.Auto
+
+local RETINA_RATIO_TOLERANCE = 0.08
+
 local ZoomState = {
     None = 0,
     ZoomingIn = 1,
@@ -92,6 +102,8 @@ local major_str, minor_str, patch_str = version:match("(%d+)%.(%d+)%.(%d+)")
 local obs_major = tonumber(major_str) or 0
 local obs_minor = tonumber(minor_str) or 0
 local obs_patch = tonumber(patch_str) or 0
+
+local last_source_dimensions = { width = 0, height = 0 }
 
 -- Helper function for version comparison
 local function obs_version_at_least(maj, min, pat)
@@ -366,11 +378,144 @@ function clamp(min, max, value)
     return math.max(min, math.min(max, value))
 end
 
+local function retina_log(message)
+    if debug_logs then
+        log("[Retina] " .. message)
+    end
+end
+
+local function approx_equal(value, target, tolerance)
+    if not value or not target then
+        return false
+    end
+
+    if target == 0 then
+        return math.abs(value) <= tolerance
+    end
+
+    local diff = math.abs(value - target)
+    local scale = math.max(math.abs(value), math.abs(target))
+    return diff <= scale * tolerance
+end
+
+local function calculate_ratio(numerator, denominator)
+    if not numerator or not denominator or numerator <= 0 or denominator <= 0 then
+        return nil
+    end
+
+    return numerator / denominator
+end
+
+local function apply_display_dimensions(info, scale, parsed_width, parsed_height, treat_parsed_as_pixels)
+    info.scale_x = scale
+    info.scale_y = scale
+
+    local function round(value)
+        if not value then
+            return 0
+        end
+        return math.floor(value + 0.5)
+    end
+
+    if treat_parsed_as_pixels and scale > 0 then
+        info.display_width = round(parsed_width / scale)
+        info.display_height = round(parsed_height / scale)
+    else
+        info.display_width = round(parsed_width)
+        info.display_height = round(parsed_height)
+    end
+end
+
+local function derive_macos_display_metrics(info, source_pixels)
+    if ffi.os ~= "OSX" then
+        return
+    end
+
+    local parsed_width = info.width or 0
+    local parsed_height = info.height or 0
+    if parsed_width == 0 or parsed_height == 0 then
+        retina_log("Retina: parsed display dimensions missing, skipping detection")
+        return
+    end
+
+    local source_width = source_pixels and source_pixels.width or 0
+    local source_height = source_pixels and source_pixels.height or 0
+    local selected_mode = retina_mode or RetinaMode.Auto
+    if selected_mode == "" then
+        selected_mode = RetinaMode.Auto
+    end
+
+    local backing_scale = get_osx_backing_scale_factor()
+    if backing_scale < 1 then
+        backing_scale = 1
+    end
+
+    retina_log(string.format(
+        "Retina: mode=%s, parsed=%dx%d, source=%dx%d, backing_scale=%.3f",
+        selected_mode, parsed_width, parsed_height, source_width, source_height, backing_scale))
+
+    local ratio_x = calculate_ratio(source_width, parsed_width)
+    local ratio_y = calculate_ratio(source_height, parsed_height)
+    local ratios_available = ratio_x ~= nil and ratio_y ~= nil
+
+    local function use_points(reason, scale_override)
+        local scale = scale_override or backing_scale
+        apply_display_dimensions(info, scale, parsed_width, parsed_height, false)
+        retina_log(reason .. string.format(" (points, scale=%.3f)", scale))
+    end
+
+    local function use_pixels(reason)
+        apply_display_dimensions(info, backing_scale, parsed_width, parsed_height, true)
+        retina_log(reason .. string.format(" (pixels, scale=%.3f)", backing_scale))
+    end
+
+    if selected_mode == RetinaMode.ForcePoints then
+        use_points("Retina mode forced to points")
+        return
+    elseif selected_mode == RetinaMode.ForcePixels then
+        use_pixels("Retina mode forced to pixels")
+        return
+    end
+
+    if backing_scale <= 1 then
+        apply_display_dimensions(info, 1, parsed_width, parsed_height, false)
+        retina_log("Retina: backing scale <= 1, treating display as standard 1x panel")
+        return
+    end
+
+    if ratios_available then
+        if approx_equal(ratio_x, backing_scale, RETINA_RATIO_TOLERANCE) and
+            approx_equal(ratio_y, backing_scale, RETINA_RATIO_TOLERANCE) then
+            use_points("Auto: display name matches point space (ratio ≈ backing scale)")
+            return
+        end
+
+        if approx_equal(ratio_x, 1, RETINA_RATIO_TOLERANCE) and approx_equal(ratio_y, 1, RETINA_RATIO_TOLERANCE) then
+            use_pixels("Auto: display name already reports pixel dimensions")
+            return
+        end
+
+        if ratio_x > 1 and ratio_x <= 3 and ratio_y > 1 and ratio_y <= 3 then
+            local avg_scale = (ratio_x + ratio_y) * 0.5
+            local rounded_scale = math.floor(avg_scale * 2 + 0.5) / 2
+            apply_display_dimensions(info, rounded_scale, parsed_width, parsed_height, false)
+            retina_log(string.format(
+                "Auto: fallback derived scale %.3f (ratios %.3f x %.3f)",
+                rounded_scale, ratio_x, ratio_y))
+            return
+        end
+    else
+        retina_log("Retina: source dimensions unavailable, delaying auto-detection until they are known")
+    end
+
+    use_points("Auto: unable to classify display name reliably, defaulting to point space")
+end
+
 ---
 -- Get the size and position of the monitor so that we know the top-left mouse point
 ---@param source any The OBS source
 ---@return table|nil monitor_info The monitor size/top-left point
-function get_monitor_info(source)
+function get_monitor_info(source, source_pixels)
     local info = nil
 
     -- Only do the expensive look up if we are using automatic calculations on a display source
@@ -428,25 +573,7 @@ function get_monitor_info(source)
                         info.display_width = info.width
                         info.display_height = info.height
 
-                        -- On macOS, get the actual backing scale factor directly from the system
-                        -- IMPORTANT: On macOS, the display name already reports dimensions in POINTS (not pixels)
-                        -- e.g., a 5K Retina display shows "2560x1440" in the display name
-                        -- NSEvent.mouseLocation also returns coordinates in POINTS
-                        -- So display_width/height should stay as-is (they're already in points)
-                        -- But we need scale_x/scale_y to convert mouse points → source pixels
-                        if ffi.os == "OSX" then
-                            local backing_scale = get_osx_backing_scale_factor()
-                            if backing_scale > 1 then
-                                info.scale_x = backing_scale
-                                info.scale_y = backing_scale
-                                -- display_width/height stay the same as width/height (both in points)
-                                -- This is correct because NSEvent.mouseLocation is also in points
-                                info.display_width = info.width
-                                info.display_height = info.height
-                                log("macOS Retina detected: backing scale factor = " .. backing_scale ..
-                                    " (display dimensions in points: " .. info.width .. "x" .. info.height .. ")")
-                            end
-                        end
+                        derive_macos_display_metrics(info, source_pixels or last_source_dimensions)
 
                         log("Parsed the following display information\n" .. format_table(info))
 
@@ -590,6 +717,10 @@ function refresh_sceneitem(find_newest)
                 -- Get the source size, for some reason this works during load but the sceneitem source doesn't
                 source_raw.width = obs.obs_source_get_width(source)
                 source_raw.height = obs.obs_source_get_height(source)
+                if source_raw.width > 0 and source_raw.height > 0 then
+                    last_source_dimensions.width = source_raw.width
+                    last_source_dimensions.height = source_raw.height
+                end
 
                 -- Get the current scene
                 local scene_source = obs.obs_frontend_get_current_scene()
@@ -619,37 +750,9 @@ function refresh_sceneitem(find_newest)
         end
     end
 
-    if not monitor_info then
-        monitor_info = get_monitor_info(source)
-    end
-
-    -- Fallback Retina detection: if direct backing scale detection didn't work (scale is still 1.0),
-    -- try to infer it by comparing source dimensions (pixels) with display name dimensions (points on macOS)
-    -- This is less reliable but provides a fallback for edge cases
-    if ffi.os == "OSX" and not use_monitor_override and monitor_info and source_raw.width > 0 and source_raw.height > 0 then
-        -- Only apply fallback if scale wasn't already detected
-        if monitor_info.scale_x == 1 and monitor_info.scale_y == 1 then
-            if monitor_info.width > 0 and monitor_info.height > 0 then
-                -- source_raw is in pixels, monitor_info.width/height are in points (on macOS)
-                local detected_scale_x = source_raw.width / monitor_info.width
-                local detected_scale_y = source_raw.height / monitor_info.height
-
-                -- Only apply if scale is reasonable (1x to 3x range covers standard and Retina displays)
-                if detected_scale_x > 1 and detected_scale_x <= 3 and detected_scale_y > 1 and detected_scale_y <= 3 then
-                    -- Round to nearest 0.5 to handle slight variations
-                    monitor_info.scale_x = math.floor(detected_scale_x * 2 + 0.5) / 2
-                    monitor_info.scale_y = math.floor(detected_scale_y * 2 + 0.5) / 2
-                    -- display_width/height should stay the same (already in points, matching NSEvent.mouseLocation)
-                    -- DO NOT divide by scale - that was the bug!
-                    monitor_info.display_width = monitor_info.width
-                    monitor_info.display_height = monitor_info.height
-
-                    log("Fallback Retina detection: scale = " .. monitor_info.scale_x .. "x" .. monitor_info.scale_y ..
-                        " (source pixels: " .. source_raw.width .. "x" .. source_raw.height ..
-                        ", display points: " .. monitor_info.width .. "x" .. monitor_info.height .. ")")
-                end
-            end
-        end
+    local detected_monitor = get_monitor_info(source, source_raw)
+    if detected_monitor then
+        monitor_info = detected_monitor
     end
 
     local is_non_display_capture = not is_display_capture(source)
@@ -1181,7 +1284,10 @@ function on_frontend_event(event)
         log("OBS Loaded")
         -- Once loaded we perform our initial lookup
         is_obs_loaded = true
-        monitor_info = get_monitor_info(source)
+        local detected_monitor = get_monitor_info(source, last_source_dimensions)
+        if detected_monitor then
+            monitor_info = detected_monitor
+        end
         refresh_sceneitem(true)
     elseif event == obs.OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN then
         log("OBS Shutting down")
@@ -1261,6 +1367,7 @@ function log_current_settings()
         socket_port = socket_port,
         socket_poll = socket_poll,
         debug_logs = debug_logs,
+        retina_mode = retina_mode,
         version = VERSION
     }
 
@@ -1331,7 +1438,10 @@ function script_properties()
     local refresh_sources = obs.obs_properties_add_button(props, "refresh", "Refresh zoom sources",
         function()
             populate_zoom_sources(sources_list)
-            monitor_info = get_monitor_info(source)
+            local detected_monitor = get_monitor_info(source, last_source_dimensions)
+            if detected_monitor then
+                monitor_info = detected_monitor
+            end
             return true
         end)
     obs.obs_property_set_long_description(refresh_sources,
@@ -1360,6 +1470,17 @@ function script_properties()
     local allow_all = obs.obs_properties_add_bool(props, "allow_all_sources", "Allow any zoom source ")
     obs.obs_property_set_long_description(allow_all, "Enable to allow selecting any source as the Zoom Source\n" ..
         "You MUST set manual source position for non-display capture sources")
+
+    if ffi.os == "OSX" then
+        local retina_prop = obs.obs_properties_add_list(props, "retina_mode", "Retina detection mode",
+            obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+        obs.obs_property_list_add_string(retina_prop, "Auto (recommended)", RetinaMode.Auto)
+        obs.obs_property_list_add_string(retina_prop, "Force display name as points", RetinaMode.ForcePoints)
+        obs.obs_property_list_add_string(retina_prop, "Force display name as pixels", RetinaMode.ForcePixels)
+        obs.obs_property_set_long_description(retina_prop,
+            "Controls how macOS Retina displays are interpreted when mapping mouse coordinates to pixels.\n" ..
+            "Use Auto unless a specific monitor requires forcing points or pixels.")
+    end
 
     local override_props = obs.obs_properties_create();
     local override_label = obs.obs_properties_add_text(override_props, "monitor_override_label", "", obs.OBS_TEXT_INFO)
@@ -1475,6 +1596,10 @@ function script_load(settings)
     socket_port = obs.obs_data_get_int(settings, "socket_port")
     socket_poll = obs.obs_data_get_int(settings, "socket_poll")
     debug_logs = obs.obs_data_get_bool(settings, "debug_logs")
+    retina_mode = obs.obs_data_get_string(settings, "retina_mode")
+    if retina_mode == "" then
+        retina_mode = RetinaMode.Auto
+    end
 
     obs.obs_frontend_add_event_callback(on_frontend_event)
 
@@ -1559,6 +1684,7 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "socket_port", 12345)
     obs.obs_data_set_default_int(settings, "socket_poll", 10)
     obs.obs_data_set_default_bool(settings, "debug_logs", false)
+    obs.obs_data_set_default_string(settings, "retina_mode", RetinaMode.Auto)
 end
 
 function script_save(settings)
@@ -1590,6 +1716,7 @@ function script_update(settings)
     local old_socket = use_socket
     local old_port = socket_port
     local old_poll = socket_poll
+    local old_retina_mode = retina_mode
 
     -- Update the settings
     source_name = obs.obs_data_get_string(settings, "source")
@@ -1615,6 +1742,10 @@ function script_update(settings)
     socket_port = obs.obs_data_get_int(settings, "socket_port")
     socket_poll = obs.obs_data_get_int(settings, "socket_poll")
     debug_logs = obs.obs_data_get_bool(settings, "debug_logs")
+    retina_mode = obs.obs_data_get_string(settings, "retina_mode")
+    if retina_mode == "" then
+        retina_mode = RetinaMode.Auto
+    end
 
     -- Only do the expensive refresh if the user selected a new source
     if source_name ~= old_source_name and is_obs_loaded then
@@ -1630,10 +1761,14 @@ function script_update(settings)
         monitor_override_h ~= old_h or
         monitor_override_sx ~= old_sx or
         monitor_override_sy ~= old_sy or
-        monitor_override_w ~= old_dw or
-        monitor_override_h ~= old_dh then
+        monitor_override_dw ~= old_dw or
+        monitor_override_dh ~= old_dh or
+        retina_mode ~= old_retina_mode then
         if is_obs_loaded then
-            monitor_info = get_monitor_info(source)
+            local detected_monitor = get_monitor_info(source, last_source_dimensions)
+            if detected_monitor then
+                monitor_info = detected_monitor
+            end
         end
     end
 

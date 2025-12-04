@@ -63,85 +63,68 @@ The error increased linearly from top to bottom of the screen.
 
 ### Key Insight
 
-On macOS, the display name dimensions are **already in points**, not pixels. The scale factor should only be applied when converting mouse coordinates to source pixel coordinates, not when setting up the display dimensions for Y-flip.
+On macOS, the numbers shown in an OBS display name (e.g. `“Studio Display: 2560x1440 @ 0,0”`) may be reported in **points** *or* in **pixels** depending on the monitor, macOS scaling mode, and which capture backend is being used. The script therefore has to *classify* the coordinate space before it can convert mouse points into captured pixels.
 
-### Code Changes
+### Detection Pipeline (v1.3.0+)
 
-**Before (v1.1.1 - Buggy):**
-```lua
-if ffi.os == "OSX" then
-    local backing_scale = get_osx_backing_scale_factor()
-    if backing_scale > 1 then
-        info.scale_x = backing_scale
-        info.scale_y = backing_scale
-        -- BUG: Dividing points by scale gives wrong result
-        info.display_width = info.width / backing_scale
-        info.display_height = info.height / backing_scale
-    end
-end
+1. **Collect observations**
+   - `parsed_width/height` – from the OBS display name.
+   - `source_width/height` – actual pixels reported by the display-capture source.
+   - `backing_scale` – `NSScreen.backingScaleFactor`.
+2. **Auto classification**
+   - If `source / parsed ≈ backing_scale`: the name is in **points** (logical coordinates).
+   - If `source / parsed ≈ 1`: the name is already in **pixels**; divide by the backing scale to recover logical coordinates.
+   - Otherwise, derive a reasonable scale from the ratios (rounded to the nearest 0.5) or fall back to assuming points when data is missing.
+3. **User override (new)**
+   - A *Retina detection mode* dropdown lets users force either interpretation when auto mode can’t deduce it.
+4. **Manual override**
+   - “Set manual source position” still bypasses auto detection entirely for edge cases.
+
+### New Retina Detection Modes
+
+| Mode | Description | Typical Use Case |
+|------|-------------|------------------|
+| `Auto (recommended)` | Uses the pipeline above to classify displays dynamically. | Works for most setups, including the “Retina 2560×1440” vs. “4K UI looks like 1920×1080” scenarios. |
+| `Force display name as points` | Treats `WxH` from the display name as logical points. | Matches the v1.2.x behavior; useful if OBS always reports point dimensions on a particular Mac. |
+| `Force display name as pixels` | Treats `WxH` as physical pixels and divides by the backing scale to get point coordinates. | Needed on some external 4K panels where OBS lists the native resolution even though the UI is scaled. |
+
+### Logging Improvements
+
+With “Enable debug logging” turned on, you now get detailed breadcrumbs in the script log:
+
+```
+[Retina] Retina: mode=auto, parsed=2560x1440, source=5120x2880, backing_scale=2.000
+[Retina] Auto: display name matches point space (ratio ≈ backing scale) (points, scale=2.000)
 ```
 
-**After (v1.2.0 - Fixed):**
-```lua
-if ffi.os == "OSX" then
-    local backing_scale = get_osx_backing_scale_factor()
-    if backing_scale > 1 then
-        info.scale_x = backing_scale
-        info.scale_y = backing_scale
-        -- CORRECT: Display dimensions stay in points (same as mouse coordinates)
-        info.display_width = info.width
-        info.display_height = info.height
-    end
-end
 ```
+[Retina] Retina: mode=auto, parsed=3840x2160, source=3840x2160, backing_scale=2.000
+[Retina] Auto: display name already reports pixel dimensions (pixels, scale=2.000)
+```
+
+```
+[Retina] Retina: mode=force_pixels, parsed=2940x1912, source=5880x3824, backing_scale=2.000
+[Retina] Retina mode forced to pixels (pixels, scale=2.000)
+```
+
+These logs make it easy to verify which model the script chose on each Mac.
 
 ### Direct Backing Scale Factor Detection
 
-v1.2.0 also adds direct detection of the backing scale factor via Objective-C runtime:
-
-```lua
-function get_osx_backing_scale_factor()
-    -- Call [NSScreen mainScreen]
-    local mainScreen = osx_msgSend(osx_nsscreen_class, osx_mainScreen_sel)
-    
-    -- Call [mainScreen backingScaleFactor]
-    -- Returns 2.0 for Retina, 1.0 for non-Retina
-    local scale = osx_msgSend_fpret(mainScreen, osx_backingScaleFactor_sel)  -- x64
-    -- or
-    local scale = ffi.cast("double(*)(void*, void*)", osx_msgSend)(...)      -- ARM64
-    
-    return scale
-end
-```
-
-**Note:** `objc_msgSend_fpret` is only available on Intel (x64) Macs. On Apple Silicon (ARM64), the regular `objc_msgSend` is cast to return `double`.
+The script still queries `[NSScreen mainScreen] backingScaleFactor` directly (with the `objc_msgSend_fpret`/`objc_msgSend` split between Intel and Apple Silicon) so that it never has to guess the scale purely from ratios.
 
 ---
 
-## Coordinate Transformation Pipeline (Correct)
+## Coordinate Transformation Pipeline (Reference)
 
-Here's how mouse coordinates should flow through the system:
+Once the display’s logical size is known, mouse coordinates flow through the system as follows:
 
 ```
-1. NSEvent.mouseLocation
-   └─→ Returns (x, y) in POINTS, bottom-left origin
-       Example: (1280, 720) for center of 2560×1440 display
-
-2. Y-flip (convert to top-left origin)
-   └─→ mouse.y = display_height - point.y
-       Example: 1440 - 720 = 720 (center, top-left origin)
-
-3. Subtract monitor offset (for multi-monitor)
-   └─→ mouse.x = mouse.x - monitor_info.x
-       mouse.y = mouse.y - monitor_info.y
-
-4. Apply scale factor (convert points to pixels)
-   └─→ mouse.x = mouse.x * scale_x
-       mouse.y = mouse.y * scale_y
-       Example: (1280 * 2, 720 * 2) = (2560, 1440) in PIXELS
-
-5. Use pixel coordinates for crop calculation
-   └─→ Now matches the source's 5120×2880 pixel space
+1. NSEvent.mouseLocation -- returns (x, y) in POINTS, bottom-left origin
+2. Y-flip: mouse.y = display_height - point.y  -- converts to top-left origin
+3. Subtract monitor offsets (multi-monitor layouts)
+4. Apply scale factor: mouse.x *= scale_x, mouse.y *= scale_y  -- convert to pixels
+5. Use the pixel-space coordinates for crop calculations
 ```
 
 ---
