@@ -210,32 +210,30 @@ function get_mouse_pos()
     if socket_mouse ~= nil then
         mouse.x = socket_mouse.x
         mouse.y = socket_mouse.y
-    else
-        if ffi.os == "Windows" then
-            if win_point and ffi.C.GetCursorPos(win_point) ~= 0 then
-                mouse.x = win_point[0].x
-                mouse.y = win_point[0].y
-            end
-        elseif ffi.os == "Linux" then
-            if x11_lib ~= nil and x11_display ~= nil and x11_root ~= nil and x11_mouse ~= nil then
-                if x11_lib.XQueryPointer(x11_display, x11_root, x11_mouse.root_win, x11_mouse.child_win, x11_mouse.root_x, x11_mouse.root_y, x11_mouse.win_x, x11_mouse.win_y, x11_mouse.mask) ~= 0 then
-                    mouse.x = tonumber(x11_mouse.win_x[0])
-                    mouse.y = tonumber(x11_mouse.win_y[0])
-                end
-            end
-        elseif ffi.os == "OSX" then
-            if osx_lib ~= nil and osx_nsevent ~= nil and osx_mouse_location ~= nil then
-                local point = osx_mouse_location(osx_nsevent.class, osx_nsevent.sel)
-                mouse.x = point.x
-                if monitor_info ~= nil then
-                    if monitor_info.display_height > 0 then
-                        mouse.y = monitor_info.display_height - point.y
-                    else
-                        mouse.y = monitor_info.height - point.y
-                    end
-                end
+        return mouse
+    end
+
+    if ffi.os == "Windows" then
+        if win_point and ffi.C.GetCursorPos(win_point) ~= 0 then
+            mouse.x = win_point[0].x
+            mouse.y = win_point[0].y
+        end
+        return mouse
+    elseif ffi.os == "Linux" then
+        if x11_lib ~= nil and x11_display ~= nil and x11_root ~= nil and x11_mouse ~= nil then
+            if x11_lib.XQueryPointer(x11_display, x11_root, x11_mouse.root_win, x11_mouse.child_win, x11_mouse.root_x, x11_mouse.root_y, x11_mouse.win_x, x11_mouse.win_y, x11_mouse.mask) ~= 0 then
+                mouse.x = tonumber(x11_mouse.win_x[0])
+                mouse.y = tonumber(x11_mouse.win_y[0])
             end
         end
+        return mouse
+    elseif ffi.os == "OSX" then
+        if osx_lib ~= nil and osx_nsevent ~= nil and osx_mouse_location ~= nil then
+            local point = osx_mouse_location(osx_nsevent.class, osx_nsevent.sel)
+            mouse.x = point.x
+            mouse.y = point.y
+        end
+        return mouse
     end
 
     return mouse
@@ -955,8 +953,16 @@ function get_target_position(zoom)
     -- This is because the display-capture source assumes top-left is 0,0 but the mouse uses the total desktop area,
     -- so a second monitor might start at x:1920, y:0 for example, so when we click at 1920,0 we want it to look like we clicked 0,0 on the source.
     if monitor_info then
-        mouse.x = mouse.x - monitor_info.x
-        mouse.y = mouse.y - monitor_info.y
+        if ffi.os == "OSX" then
+            local local_x = mouse.x - monitor_info.x
+            local local_y = mouse.y - monitor_info.y
+            local display_height = monitor_info.display_height or monitor_info.height or 0
+            mouse.x = local_x
+            mouse.y = display_height - local_y
+        else
+            mouse.x = mouse.x - monitor_info.x
+            mouse.y = mouse.y - monitor_info.y
+        end
     end
 
     -- Now offset the mouse by the crop top-left because if we cropped 100px off of the display clicking at 100,0 should really be the top-left 0,0
