@@ -45,13 +45,23 @@ local x11_display = nil
 local x11_root = nil
 local x11_mouse = nil
 local osx_lib = nil
+local osx_cf_lib = nil
+local osx_display_lib = nil
 local osx_nsevent = nil
 local osx_mouse_location = nil
 local osx_nsscreen_class = nil
 local osx_mainScreen_sel = nil
+local osx_screens_sel = nil
+local osx_count_sel = nil
+local osx_objectAtIndex_sel = nil
+local osx_frame_sel = nil
+local osx_deviceDescription_sel = nil
+local osx_objectForKey_sel = nil
+local osx_unsignedIntValue_sel = nil
 local osx_backingScaleFactor_sel = nil
 local osx_msgSend = nil
 local osx_msgSend_fpret = nil
+local osx_msgSend_stret = nil
 
 local use_auto_follow_mouse = true
 local use_follow_outside_bounds = false
@@ -157,6 +167,20 @@ elseif ffi.os == "OSX" then
             double x;
             double y;
         } CGPoint;
+        typedef struct {
+            double width;
+            double height;
+        } CGSize;
+        typedef struct {
+            CGPoint origin;
+            CGSize size;
+        } CGRect;
+        typedef CGRect NSRect;
+        typedef unsigned long NSUInteger;
+        typedef unsigned int CGDirectDisplayID;
+        typedef const void* CFAllocatorRef;
+        typedef const void* CFStringRef;
+        typedef const void* CFUUIDRef;
         typedef void* SEL;
         typedef void* id;
         typedef void* Method;
@@ -169,14 +193,43 @@ elseif ffi.os == "OSX" then
 
         // objc_msgSend for calling Objective-C methods
         id objc_msgSend(id self, SEL op, ...);
+
+        CFStringRef CFStringCreateWithCString(CFAllocatorRef alloc, const char *cStr, unsigned int encoding);
+        CFUUIDRef CFUUIDCreateFromString(CFAllocatorRef alloc, CFStringRef uuidStr);
+        void CFRelease(const void *cf);
+        CGDirectDisplayID CGDisplayGetDisplayIDFromUUID(CFUUIDRef uuid);
     ]])
 
     -- objc_msgSend_fpret only exists on x86_64, not on ARM64
     if ffi.arch == "x64" then
         ffi.cdef([[
             double objc_msgSend_fpret(id self, SEL op, ...);
+            void objc_msgSend_stret(void *stretAddr, id self, SEL op, ...);
         ]])
     end
+
+    local function load_osx_library(names)
+        for _, name in ipairs(names) do
+            local ok, lib = pcall(ffi.load, name)
+            if ok then
+                return lib
+            end
+        end
+
+        return nil
+    end
+
+    osx_cf_lib = load_osx_library({
+        "CoreFoundation",
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    })
+    -- CGDisplayGetDisplayIDFromUUID is exported by ColorSync on current macOS SDKs.
+    osx_display_lib = load_osx_library({
+        "ColorSync",
+        "/System/Library/Frameworks/ColorSync.framework/ColorSync",
+        "CoreGraphics",
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+    })
 
     osx_lib = ffi.load("libobjc")
     if osx_lib ~= nil then
@@ -193,10 +246,18 @@ elseif ffi.os == "OSX" then
         -- Setup for getting backing scale factor from NSScreen
         osx_nsscreen_class = osx_lib.objc_getClass("NSScreen")
         osx_mainScreen_sel = osx_lib.sel_registerName("mainScreen")
+        osx_screens_sel = osx_lib.sel_registerName("screens")
+        osx_count_sel = osx_lib.sel_registerName("count")
+        osx_objectAtIndex_sel = osx_lib.sel_registerName("objectAtIndex:")
+        osx_frame_sel = osx_lib.sel_registerName("frame")
+        osx_deviceDescription_sel = osx_lib.sel_registerName("deviceDescription")
+        osx_objectForKey_sel = osx_lib.sel_registerName("objectForKey:")
+        osx_unsignedIntValue_sel = osx_lib.sel_registerName("unsignedIntValue")
         osx_backingScaleFactor_sel = osx_lib.sel_registerName("backingScaleFactor")
         osx_msgSend = osx_lib.objc_msgSend
         if ffi.arch == "x64" then
             osx_msgSend_fpret = osx_lib.objc_msgSend_fpret
+            osx_msgSend_stret = osx_lib.objc_msgSend_stret
         end
     end
 end
@@ -239,6 +300,179 @@ function get_mouse_pos()
     return mouse
 end
 
+local OSX_CF_STRING_ENCODING_UTF8 = 0x08000100
+
+local function osx_call_double(target, selector)
+    if target == nil or selector == nil or osx_msgSend == nil then
+        return nil
+    end
+
+    if ffi.arch == "x64" then
+        if osx_msgSend_fpret == nil then
+            return nil
+        end
+        return tonumber(osx_msgSend_fpret(target, selector))
+    end
+
+    local msgSend_double = ffi.cast("double(*)(id, SEL)", osx_msgSend)
+    return tonumber(msgSend_double(target, selector))
+end
+
+local function osx_call_rect(target, selector)
+    if target == nil or selector == nil or osx_msgSend == nil then
+        return nil
+    end
+
+    if ffi.arch == "x64" then
+        if osx_msgSend_stret == nil then
+            return nil
+        end
+        local rect = ffi.new("NSRect[1]")
+        osx_msgSend_stret(rect, target, selector)
+        return rect[0]
+    end
+
+    local msgSend_rect = ffi.cast("NSRect(*)(id, SEL)", osx_msgSend)
+    return msgSend_rect(target, selector)
+end
+
+local function osx_create_cfstring(value)
+    if osx_cf_lib == nil or value == nil or value == "" then
+        return nil
+    end
+
+    return osx_cf_lib.CFStringCreateWithCString(nil, tostring(value), OSX_CF_STRING_ENCODING_UTF8)
+end
+
+local function get_osx_display_id_from_uuid(display_uuid)
+    if ffi.os ~= "OSX" then
+        return nil, "not macOS"
+    end
+    if osx_cf_lib == nil or osx_display_lib == nil then
+        return nil, "CoreFoundation/ColorSync unavailable"
+    end
+    if display_uuid == nil or display_uuid == "" then
+        return nil, "display_uuid missing"
+    end
+
+    local uuid_string = osx_create_cfstring(display_uuid)
+    if uuid_string == nil then
+        return nil, "failed to create CFString for display_uuid"
+    end
+
+    local uuid_ref = osx_cf_lib.CFUUIDCreateFromString(nil, uuid_string)
+    osx_cf_lib.CFRelease(uuid_string)
+    if uuid_ref == nil then
+        return nil, "failed to create CFUUID from display_uuid"
+    end
+
+    local display_id = tonumber(osx_display_lib.CGDisplayGetDisplayIDFromUUID(uuid_ref))
+    osx_cf_lib.CFRelease(uuid_ref)
+    if display_id == nil or display_id == 0 then
+        return nil, "display_uuid did not resolve to a display"
+    end
+
+    return display_id, nil
+end
+
+local function get_osx_screen_geometry_for_display_id(display_id)
+    if ffi.os ~= "OSX" then
+        return nil, "not macOS"
+    end
+    if osx_lib == nil or osx_nsscreen_class == nil or osx_msgSend == nil then
+        return nil, "Objective-C runtime unavailable"
+    end
+    if osx_screens_sel == nil or osx_count_sel == nil or osx_objectAtIndex_sel == nil or
+        osx_frame_sel == nil or osx_deviceDescription_sel == nil or osx_objectForKey_sel == nil or
+        osx_unsignedIntValue_sel == nil or osx_backingScaleFactor_sel == nil then
+        return nil, "NSScreen selectors unavailable"
+    end
+    if display_id == nil or display_id == 0 then
+        return nil, "display id missing"
+    end
+
+    local screens = osx_msgSend(osx_nsscreen_class, osx_screens_sel)
+    if screens == nil then
+        return nil, "NSScreen screens unavailable"
+    end
+
+    local screen_number_key = osx_create_cfstring("NSScreenNumber")
+    if screen_number_key == nil then
+        return nil, "failed to create NSScreenNumber key"
+    end
+
+    local count_fn = ffi.cast("NSUInteger(*)(id, SEL)", osx_msgSend)
+    local object_at_index_fn = ffi.cast("id(*)(id, SEL, NSUInteger)", osx_msgSend)
+    local object_for_key_fn = ffi.cast("id(*)(id, SEL, id)", osx_msgSend)
+    local unsigned_int_value_fn = ffi.cast("unsigned int(*)(id, SEL)", osx_msgSend)
+    local count = tonumber(count_fn(screens, osx_count_sel)) or 0
+    local matched_screen = nil
+
+    for i = 0, count - 1 do
+        local screen = object_at_index_fn(screens, osx_objectAtIndex_sel, i)
+        if screen ~= nil then
+            local device_description = osx_msgSend(screen, osx_deviceDescription_sel)
+            if device_description ~= nil then
+                local screen_number = object_for_key_fn(device_description, osx_objectForKey_sel, ffi.cast("id", screen_number_key))
+                if screen_number ~= nil then
+                    local screen_display_id = tonumber(unsigned_int_value_fn(screen_number, osx_unsignedIntValue_sel))
+                    if screen_display_id == display_id then
+                        matched_screen = screen
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    osx_cf_lib.CFRelease(screen_number_key)
+
+    if matched_screen == nil then
+        return nil, "no NSScreen matched display id " .. tostring(display_id)
+    end
+
+    local frame = osx_call_rect(matched_screen, osx_frame_sel)
+    local scale = osx_call_double(matched_screen, osx_backingScaleFactor_sel) or 1.0
+    if frame == nil then
+        return nil, "matched NSScreen frame unavailable"
+    end
+    if scale < 1 or scale ~= scale then
+        scale = 1.0
+    end
+
+    return {
+        x = tonumber(frame.origin.x) or 0,
+        y = tonumber(frame.origin.y) or 0,
+        width = tonumber(frame.size.width) or 0,
+        height = tonumber(frame.size.height) or 0,
+        scale = scale
+    }, nil
+end
+
+local function get_osx_display_geometry_for_uuid(display_uuid)
+    local ok, geometry, reason = pcall(function()
+        local display_id, display_id_reason = get_osx_display_id_from_uuid(display_uuid)
+        if not display_id then
+            return nil, display_id_reason
+        end
+
+        local screen_geometry, screen_reason = get_osx_screen_geometry_for_display_id(display_id)
+        if not screen_geometry then
+            return nil, screen_reason
+        end
+
+        screen_geometry.display_id = display_id
+        screen_geometry.display_uuid = display_uuid
+        return screen_geometry, nil
+    end)
+
+    if not ok then
+        return nil, tostring(geometry)
+    end
+
+    return geometry, reason
+end
+
 ---
 -- Get the macOS backing scale factor (Retina scaling)
 -- Returns the scale factor for the main screen (typically 2.0 for Retina, 1.0 for non-Retina)
@@ -261,13 +495,9 @@ function get_osx_backing_scale_factor()
     -- Call [mainScreen backingScaleFactor]
     -- On x86_64 macOS, objc_msgSend_fpret is used for methods returning floating point
     -- On ARM64, regular objc_msgSend works for all types
-    local scale = 1.0
-    if ffi.arch == "x64" then
-        scale = osx_msgSend_fpret(mainScreen, osx_backingScaleFactor_sel)
-    else
-        -- For ARM64, cast objc_msgSend to return double
-        local msgSend_double = ffi.cast("double(*)(void*, void*)", osx_msgSend)
-        scale = msgSend_double(mainScreen, osx_backingScaleFactor_sel)
+    local scale = osx_call_double(mainScreen, osx_backingScaleFactor_sel) or 1.0
+    if scale < 1 or scale ~= scale then
+        scale = 1.0
     end
 
     return scale
@@ -404,6 +634,29 @@ local function calculate_ratio(numerator, denominator)
     return numerator / denominator
 end
 
+local function parse_display_name(display_name)
+    if not display_name or display_name == "" then
+        return nil
+    end
+
+    local width, height, x, y = display_name:match("(%d+)x(%d+)%s*@%s*(-?%d+),(-?%d+)")
+    if not width or not height or not x or not y then
+        return nil
+    end
+
+    return {
+        x = tonumber(x, 10) or 0,
+        y = tonumber(y, 10) or 0,
+        width = tonumber(width, 10) or 0,
+        height = tonumber(height, 10) or 0,
+        scale_x = 1,
+        scale_y = 1,
+        display_width = tonumber(width, 10) or 0,
+        display_height = tonumber(height, 10) or 0,
+        geometry_source = "parsed_name"
+    }
+end
+
 local function apply_display_dimensions(info, scale, parsed_width, parsed_height, treat_parsed_as_pixels)
     info.scale_x = scale
     info.scale_y = scale
@@ -424,7 +677,45 @@ local function apply_display_dimensions(info, scale, parsed_width, parsed_height
     end
 end
 
-local function derive_macos_display_metrics(info, source_pixels)
+local function apply_native_display_geometry(native_geometry)
+    if not native_geometry then
+        return nil
+    end
+
+    local scale = native_geometry.scale or 1.0
+    if scale < 1 or scale ~= scale then
+        scale = 1.0
+    end
+
+    local width = native_geometry.width or 0
+    local height = native_geometry.height or 0
+    if width <= 0 or height <= 0 then
+        retina_log("Native display geometry invalid, falling back to display-name parsing")
+        return nil
+    end
+
+    local info = {
+        x = native_geometry.x or 0,
+        y = native_geometry.y or 0,
+        width = width,
+        height = height,
+        scale_x = scale,
+        scale_y = scale,
+        display_width = width,
+        display_height = height,
+        display_uuid = native_geometry.display_uuid,
+        display_id = native_geometry.display_id,
+        geometry_source = "native_uuid"
+    }
+
+    retina_log(string.format(
+        "Native display geometry: uuid=%s, display_id=%s, frame=%.0fx%.0f @ %.0f,%.0f, scale=%.3f",
+        tostring(info.display_uuid), tostring(info.display_id), info.width, info.height, info.x, info.y, scale))
+
+    return info
+end
+
+local function derive_macos_display_metrics(info, source_pixels, backing_scale_override)
     if ffi.os ~= "OSX" then
         return
     end
@@ -443,14 +734,15 @@ local function derive_macos_display_metrics(info, source_pixels)
         selected_mode = RetinaMode.Auto
     end
 
-    local backing_scale = get_osx_backing_scale_factor()
-    if backing_scale < 1 then
+    local backing_scale = backing_scale_override or get_osx_backing_scale_factor()
+    if backing_scale < 1 or backing_scale ~= backing_scale then
         backing_scale = 1
     end
 
     retina_log(string.format(
-        "Retina: mode=%s, parsed=%dx%d, source=%dx%d, backing_scale=%.3f",
-        selected_mode, parsed_width, parsed_height, source_width, source_height, backing_scale))
+        "Retina: mode=%s, parsed=%dx%d, source=%dx%d, backing_scale=%.3f%s",
+        selected_mode, parsed_width, parsed_height, source_width, source_height, backing_scale,
+        backing_scale_override and " (matched display)" or ""))
 
     local ratio_x = calculate_ratio(source_width, parsed_width)
     local ratio_y = calculate_ratio(source_height, parsed_height)
@@ -525,17 +817,21 @@ function get_monitor_info(source, source_pixels)
                 local monitor_id_prop = obs.obs_properties_get(props, dc_info.prop_id)
                 if monitor_id_prop then
                     local found = nil
+                    local selected_display_id = nil
+                    local selected_display_uuid = nil
                     local settings = obs.obs_source_get_settings(source)
                     if settings ~= nil then
                         local to_match
                         if dc_info.prop_type == "string" then
                             to_match = obs.obs_data_get_string(settings, dc_info.prop_id)
+                            selected_display_uuid = to_match
                         elseif dc_info.prop_type == "int" then
                             to_match = obs.obs_data_get_int(settings, dc_info.prop_id)
+                            selected_display_id = to_match
                         end
 
                         local item_count = obs.obs_property_list_item_count(monitor_id_prop);
-                        for i = 0, item_count do
+                        for i = 0, item_count - 1 do
                             local name = obs.obs_property_list_item_name(monitor_id_prop, i)
                             local value
                             if dc_info.prop_type == "string" then
@@ -544,36 +840,74 @@ function get_monitor_info(source, source_pixels)
                                 value = obs.obs_property_list_item_int(monitor_id_prop, i)
                             end
 
-                            if value == to_match then
-                                found = name
-                                break
+                            if dc_info.prop_type == "string" then
+                                if value and value ~= "" and to_match and to_match ~= "" and value == to_match then
+                                    found = name
+                                    break
+                                end
+                            else
+                                if value == to_match then
+                                    found = name
+                                    break
+                                end
                             end
                         end
                         obs.obs_data_release(settings)
                     end
 
-                    -- This works for my machine as the monitor names are given as "U2790B: 3840x2160 @ -1920,0 (Primary Monitor)"
-                    -- I don't know if this holds true for other machines and/or OBS versions
-                    -- TODO: Update this with some custom FFI calls to find the monitor top-left x and y coordinates if it doesn't work for anyone else
-                    -- TODO: Refactor this into something that would work with Windows/Linux/Mac assuming we can't do it like this
-                    if found then
+                    local selected_mode = retina_mode or RetinaMode.Auto
+                    if selected_mode == "" then
+                        selected_mode = RetinaMode.Auto
+                    end
+
+                    local native_geometry = nil
+                    if ffi.os == "OSX" and dc_info.prop_type == "string" then
+                        retina_log("Selected display_uuid: " .. tostring(selected_display_uuid))
+                        local native_reason
+                        native_geometry, native_reason = get_osx_display_geometry_for_uuid(selected_display_uuid)
+                        if native_geometry then
+                            retina_log("Resolved display_uuid to display_id: " .. tostring(native_geometry.display_id))
+                        else
+                            retina_log("Native display lookup failed: " .. tostring(native_reason))
+                        end
+                    end
+
+                    if ffi.os == "OSX" and selected_mode == RetinaMode.Auto and native_geometry then
+                        info = apply_native_display_geometry(native_geometry)
+                    end
+
+                    if not info and found then
                         log("Parsing display name: " .. found)
-                        local x, y = found:match("(-?%d+),(-?%d+)")
-                        local width, height = found:match("(%d+)x(%d+)")
+                        info = parse_display_name(found)
+                        if info then
+                            info.display_uuid = selected_display_uuid
+                            info.display_id = selected_display_id or (native_geometry and native_geometry.display_id)
 
-                        info = { x = 0, y = 0, width = 0, height = 0 }
-                        info.x = tonumber(x, 10)
-                        info.y = tonumber(y, 10)
-                        info.width = tonumber(width, 10)
-                        info.height = tonumber(height, 10)
-                        info.scale_x = 1
-                        info.scale_y = 1
-                        info.display_width = info.width
-                        info.display_height = info.height
+                            derive_macos_display_metrics(
+                                info,
+                                source_pixels or last_source_dimensions,
+                                native_geometry and native_geometry.scale or nil)
 
-                        derive_macos_display_metrics(info, source_pixels or last_source_dimensions)
+                            log("Parsed the following display information\n" .. format_table(info))
+                        else
+                            retina_log("Unable to parse display name: " .. tostring(found))
+                        end
+                    end
 
-                        log("Parsed the following display information\n" .. format_table(info))
+                    if not info and native_geometry then
+                        if selected_mode == RetinaMode.Auto then
+                            retina_log("Using native display geometry after display-name parsing failed")
+                        else
+                            retina_log("Force mode requested but display-name parsing failed; using native geometry as last resort")
+                        end
+                        info = apply_native_display_geometry(native_geometry)
+                    end
+
+                    if info then
+                        if not info.geometry_source then
+                            info.geometry_source = "parsed_name"
+                        end
+                        retina_log("Final monitor_info source: " .. tostring(info.geometry_source))
 
                         if info.width == 0 and info.height == 0 then
                             info = nil
@@ -595,8 +929,12 @@ function get_monitor_info(source, source_pixels)
             scale_x = monitor_override_sx,
             scale_y = monitor_override_sy,
             display_width = monitor_override_dw,
-            display_height = monitor_override_dh
+            display_height = monitor_override_dh,
+            geometry_source = "manual_override"
         }
+        if ffi.os == "OSX" then
+            retina_log("Final monitor_info source: manual_override")
+        end
     end
 
     if not info then

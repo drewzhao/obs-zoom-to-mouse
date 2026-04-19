@@ -68,23 +68,28 @@ On macOS, the numbers shown in an OBS display name (e.g. `“Studio Display: 256
 ### Detection Pipeline (v1.3.0+)
 
 1. **Collect observations**
+   - `display_uuid` – from the selected OBS display-capture source.
+   - Native `NSScreen.frame` and `NSScreen.backingScaleFactor` – resolved from the display UUID when possible.
    - `parsed_width/height` – from the OBS display name.
    - `source_width/height` – actual pixels reported by the display-capture source.
-   - `backing_scale` – `NSScreen.backingScaleFactor`.
-2. **Auto classification**
+2. **Native UUID lookup (Auto mode)**
+   - Convert the OBS `display_uuid` to a `CGDirectDisplayID`.
+   - Match that display ID to the corresponding `NSScreen`.
+   - Use that screen's frame for logical point coordinates and that screen's backing scale for point-to-pixel conversion.
+3. **Parsed-name fallback**
    - If `source / parsed ≈ backing_scale`: the name is in **points** (logical coordinates).
    - If `source / parsed ≈ 1`: the name is already in **pixels**; divide by the backing scale to recover logical coordinates.
    - Otherwise, derive a reasonable scale from the ratios (rounded to the nearest 0.5) or fall back to assuming points when data is missing.
-3. **User override (new)**
-   - A *Retina detection mode* dropdown lets users force either interpretation when auto mode can’t deduce it.
-4. **Manual override**
+4. **User override**
+   - A *Retina detection mode* dropdown lets users force either display-name interpretation when auto mode can’t deduce it.
+5. **Manual override**
    - “Set manual source position” still bypasses auto detection entirely for edge cases.
 
 ### New Retina Detection Modes
 
 | Mode | Description | Typical Use Case |
 |------|-------------|------------------|
-| `Auto (recommended)` | Uses the pipeline above to classify displays dynamically. | Works for most setups, including the “Retina 2560×1440” vs. “4K UI looks like 1920×1080” scenarios. |
+| `Auto (recommended)` | Uses native UUID-to-`NSScreen` geometry first, then falls back to parsed-name classification. | Works for most setups, including mixed Retina/non-Retina multi-monitor layouts. |
 | `Force display name as points` | Treats `WxH` from the display name as logical points. | Matches the v1.2.x behavior; useful if OBS always reports point dimensions on a particular Mac. |
 | `Force display name as pixels` | Treats `WxH` as physical pixels and divides by the backing scale to get point coordinates. | Needed on some external 4K panels where OBS lists the native resolution even though the UI is scaled. |
 
@@ -93,6 +98,14 @@ On macOS, the numbers shown in an OBS display name (e.g. `“Studio Display: 256
 With “Enable debug logging” turned on, you now get detailed breadcrumbs in the script log:
 
 ```
+[Retina] Selected display_uuid: 37D8832A-2D66-02CA-B9F7-8F30A301B230
+[Retina] Resolved display_uuid to display_id: 1
+[Retina] Native display geometry: uuid=37D8832A-2D66-02CA-B9F7-8F30A301B230, display_id=1, frame=2560x1440 @ 0,0, scale=2.000
+[Retina] Final monitor_info source: native_uuid
+```
+
+```
+[Retina] Native display lookup failed: display_uuid did not resolve to a display
 [Retina] Retina: mode=auto, parsed=2560x1440, source=5120x2880, backing_scale=2.000
 [Retina] Auto: display name matches point space (ratio ≈ backing scale) (points, scale=2.000)
 ```
@@ -109,9 +122,9 @@ With “Enable debug logging” turned on, you now get detailed breadcrumbs in t
 
 These logs make it easy to verify which model the script chose on each Mac.
 
-### Direct Backing Scale Factor Detection
+### Per-Display Backing Scale Factor Detection
 
-The script still queries `[NSScreen mainScreen] backingScaleFactor` directly (with the `objc_msgSend_fpret`/`objc_msgSend` split between Intel and Apple Silicon) so that it never has to guess the scale purely from ratios.
+In Auto mode, the script resolves OBS's selected `display_uuid` to the captured `NSScreen` and reads that screen's `backingScaleFactor`. This avoids using `[NSScreen mainScreen]`, which can be the wrong display on mixed-DPI multi-monitor setups. If the native lookup fails, the script falls back to the parsed-name classifier and the main-screen scale fallback.
 
 ---
 
@@ -234,4 +247,3 @@ if sys.platform == 'darwin':
 - Original bug report and testing: User community
 - Lua fix implementation: v1.2.0
 - Python fix implementation: v2.1.0
-
