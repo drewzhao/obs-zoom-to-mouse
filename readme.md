@@ -1,139 +1,150 @@
-# OBS-Zoom-To-Mouse
+# OBS Zoom to Mouse
 
-An OBS lua script to zoom a display-capture source to focus on the mouse. 
+OBS Zoom to Mouse is a maintained Lua script for OBS Studio that zooms a selected source toward the mouse, a remote point, or a remote rectangle target.
 
-I made this for my own use when recording videos as I wanted a way to zoom into my IDE when highlighting certain sections of code. My particular setup didn't seem to work very well with the existing zooming solutions so I created this.
+It is tuned for software tutorials, code walkthroughs, product demos, and screen recordings where zoom should guide attention clearly without feeling flashy. The current implementation uses duration-based animation, easing presets, cursor-settle timing, safe-zone follow behavior, optional subtle overshoot, and macOS Retina-aware coordinate handling.
 
-Built with OBS v29.1.3
+The Lua script is now the only maintained runtime. The earlier Python implementation has been removed because it used the same OBS Crop/Pad rendering path while adding a second dependency stack.
 
-Now works on **Windows**, **Linux**, and **Mac**
+Inspired by [tryptech](https://github.com/tryptech)'s [obs-zoom-and-follow](https://github.com/tryptech/obs-zoom-and-follow).
 
-Inspired by [tryptech](https://github.com/tryptech)'s [obs-zoom-and-follow](https://github.com/tryptech/obs-zoom-and-follow)
+## Relationship to Upstream
+
+This project began as a fork of `BlankSourceCode/obs-zoom-to-mouse`.
+
+It was detached from GitHub's fork network on 2026-05-14 so it can be maintained as an independent project with a different roadmap. Detaching the repository does not remove attribution, rewrite Git history, change the license status of the original work, or imply that this project is the original upstream project.
+
+- Original upstream project: [BlankSourceCode/obs-zoom-to-mouse](https://github.com/BlankSourceCode/obs-zoom-to-mouse)
+- Fork point / base commit: `53dc1a5425c2a96db34fb34aae40283f84bf1720`
+- Base commit date: 2024-02-12
+- Original license status: no `LICENSE` file is present in this repository snapshot. This README does not grant additional rights or relicense upstream work.
+- Original copyright notice: `obs-zoom-to-mouse.lua` retains `Copyright (c) BlankSourceCode.  All rights reserved.`
+- Git history is preserved so upstream contributors remain credited in commit metadata.
+
+This repository is not endorsed by, affiliated with, or presented as an official continuation of the upstream project unless the upstream project says so explicitly. See [ATTRIBUTIONS.md](ATTRIBUTIONS.md) for provenance details.
 
 ## Example
+
 ![Usage Demo](obs-zoom-to-mouse.gif)
 
-## Install
-1. Git clone the repo (or just save a copy of `obs-zoom-to-mouse.lua`)
-1. Launch OBS
-1. In OBS, add a `Display Capture` source (if you don't have one already)
-1. In OBS, open Tools -> Scripts
-1. In the Scripts window, press the `+` button to add a new script
-1. Find and add the `obs-zoom-to-mouse.lua` script
-1. For best results use the following settings on your `Display Capture` source
-   * Transform:
-      * Positional Alignment - `Top Left`
-      * Bounding Box type -  `Scale to inner bounds`
-      * Alignment in Bounding Box - `Top Left`
-      * Crop - All **zeros**
-   * If you want to crop the display, add a new Filter -> `Crop/Pad`
-      * Relative - `False`
-      * X - Amount to crop from left side
-      * Y - Amount to crop form top side
-      * Width - Full width of display minus the value of X + amount to crop from right side
-      * Height - Full height of display minus the value of Y + amount to crop from bottom side
-   
-   **Note:** If you don't use this form of setup for your display source (E.g. you have bounding box set to `No bounds` or you have a `Crop` set on the transform), the script will attempt to **automatically change your settings** to zoom compatible ones. 
-   This may have undesired effects on your layout (or just not work at all).
+## Documentation
 
-   **Note:** If you change your desktop display properties in Windows (such as moving a monitor, changing your primary display, updating the orientation of a display), you will need to re-add your display capture source in OBS for it to update the values that the script uses for its auto calculations. You will then need to reload the script.
+Read the docs for usage details:
 
-## Usage
-1. You can customize the following settings in the OBS Scripts window:
-   * **Zoom Source**: The display capture in the current scene to use for zooming
-   * **Zoom Factor**: How much to zoom in by
-   * **Zoom Speed**: The speed of the zoom in/out animation
-   * **Auto follow mouse**: True to track the cursor automatically while you are zoomed in, instead of waiting for the `Toggle follow` hotkey to be pressed first
-   * **Follow outside bounds**: True to track the cursor even when it is outside the bounds of the source
-   * **Follow Speed**: The speed at which the zoomed area will follow the mouse when tracking
-   * **Follow Border**: The %distance from the edge of the source that will re-enable mouse tracking
-   * **Lock Sensitivity**: How close the tracking needs to get before it locks into position and stops tracking until you enter the follow border
-   * **Auto Lock on reverse direction**: Automatically stop tracking if you reverse the direction of the mouse.
-   * **Show all sources**: True to allow selecting any source as the Zoom Source - Note: You **MUST** set manual source position for non-display capture sources
-   * **Set manual source position**: True to override the calculated x/y (topleft position), width/height (size), and scaleX/scaleY (canvas scale factor) for the selected source. This is essentially the area of the desktop that the selected zoom source represents. Usually the script can calculate this, but if you are using a non-display capture source, or if the script gets it wrong, you can manually set the values.
-   * **X**: The coordinate of the left most pixel of the source
-   * **Y**: The coordinate of the top most pixel of the source
-   * **Width**: The width of the source (in pixels)
-   * **Height**: The height of the source (in pixels)
-   * **Scale X**: The x scale factor to apply to the mouse position if the source is not 1:1 pixel size (normally left as 1, but useful for cloned sources that have been scaled)
-   * **Scale Y**: The y scale factor to apply to the mouse position if the source is not 1:1 pixel size (normally left as 1, but useful for cloned sources that have been scaled)
-   * **Monitor Width**: The width of the monitor that is showing the source (in pixels)
-   * **Monitor Height**: The height of the monitor that is showing the source (in pixels)
-   * **More Info**: Show this text in the script log
-   * **Enable debug logging**: Show additional debug information in the script log
+- [User guide](docs/USER_GUIDE.md): installation, recommended setup, hotkeys, presets, tuning, remote targeting, troubleshooting, and verification.
+- [Lua design and architecture](docs/LUA_SCRIPT_DESIGN_AND_ARCHITECTURE.md): how the script is structured internally, including OBS lifecycle, Crop/Pad ownership, target framing, animation, follow behavior, and cleanup.
+- [Retina display notes](docs/RETINA_DISPLAY_FIX.md): macOS coordinate-space behavior and debugging guidance.
+- [Attributions](ATTRIBUTIONS.md): upstream provenance, fork point, and copyright notice details.
 
-1. In OBS, open File -> Settings -> Hotkeys 
-   * Add a hotkey for `Toggle zoom to mouse` to zoom in and out
-   * Add a hotkey for `Toggle follow mouse during zoom` to turn mouse tracking on and off (*Optional*)
+The README is intentionally a quick entrypoint. Treat the user guide as the source of truth for operating the script.
 
-### Dual Machine Support
-1. The script also has some **basic** dual machine setup support. By using my related project [obs-zoom-to-mouse-remote](https://github.com/BlankSourceCode/obs-zoom-to-mouse-remote) you will be able to track the mouse on your second machine
-1. When you have [ljsocket.lua](https://github.com/BlankSourceCode/obs-zoom-to-mouse-remote) in the same directory as `obs-zoom-to-mouse.lua`, the following settings will also be available:
-   * **Enable remote mouse listener**: True to start a UDP socket server that will listen for mouse position messages from a remote client
-   * **Port**: The port number to use for the socket server
-   * **Poll Delay**: The time between updating the mouse position (in milliseconds)
-   * For more information see [obs-zoom-to-mouse-remote](https://github.com/BlankSourceCode/obs-zoom-to-mouse-remote)
+## Requirements
 
-### More information on how mouse tracking works
-When you press the `Toggle zoom` hotkey the script will use the current mouse position as the center of the zoom. The script will then animate the width/height values of a crop/pan filter so it appears to zoom into that location. If you have `Auto follow mouse` turned on, then the x/y values of the filter will also change to keep the mouse in view as it is animating the zoom. Once the animation is complete, the script gives you a "safe zone" to move your cursor in without it moving the "camera". The idea was that you'd want to zoom in somewhere and move your mouse around to highlight code or whatever, without the screen moving so it would be easier to read text in the video.
+- OBS Studio with Lua scripting support.
+- A display-capture source for automatic source geometry detection.
+- Optional: `ljsocket.lua` next to `obs-zoom-to-mouse.lua` for UDP remote mouse and rectangle targeting.
 
-When you move your mouse to the edge of the zoom area, it will then start tracking the cursor and follow it around at the `Follow Speed`. It will continue to follow the cursor until you hold the mouse still for some amount of time determined by `Lock Sensitivity` at which point it will stop following and give you that safe zone again but now at the new center of the zoom.
+The Lua script is intended for Windows, Linux, and macOS. macOS Retina and mixed-DPI behavior is documented separately in [docs/RETINA_DISPLAY_FIX.md](docs/RETINA_DISPLAY_FIX.md).
 
-How close you need to get to the edge of the zoom to trigger the 'start following mode' is determined by the `Follow Border` setting. This value is a pertentage of the area from the edge. If you set this to 0%, it means that you need to move the mouse to the very edge of the area to trigger mouse tracking. Something like 4% will give you a small border around the area. Setting it to full 50% causes it to begin following the mouse whenever it gets closer than 50% to an edge, which means it will follow the cursor *all the time* essentially removing the "safe zone".
+The script can also zoom non-display sources, but those usually require manual source-position settings because OBS does not expose enough desktop geometry for arbitrary sources.
 
-You can also modify this behavior with the `Auto Lock on reverse direction` setting, which attempts to make the follow work more like camera panning in a video game. When moving your mouse to the edge of the screen (how close determined by `Follow Border`) it will cause the camera to pan in that direction. Instead of continuing to track the mouse until you keep it still, with this setting it will also stop tracking immediately if you move your mouse back towards the center.
+## Quick Start
 
-### More information on 'Show All Sources'
-If you enable the `Show all sources` option, you will be able to select any OBS source as the `Zoom Source`. This includes **any** non-display capture items such as cloned sources, browsers, or windows (or even things like audio input - which really won't work!).
+1. Clone this repo or save a copy of `obs-zoom-to-mouse.lua`.
+2. Launch OBS.
+3. Add a `Display Capture` source to the scene.
+4. Open `Tools -> Scripts`.
+5. Add `obs-zoom-to-mouse.lua`.
+6. Select your display capture in `Zoom Source`.
+7. Keep `Motion Preset` set to `Tutorial` for a natural default.
+8. Open `Settings -> Hotkeys`.
+9. Assign `Toggle zoom to mouse`.
+10. Optionally assign `Toggle follow mouse during zoom`.
 
-Selecting a non-display capture zoom source means the script will **not be able to automatically calculate the position and size of the source**, so zooming and tracking the mouse position will be wrong!
+For exact source transform recommendations and all setting details, read [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
-To fix this, you MUST manually enter the size and position of your selected zoom source by enabling the `Set manual source position` option and filling in the `X`, `Y`, `Width`, and `Height` values. These values are the pixel topleft position and pixel size of the source on your overall desktop. You may also need to set the `Scale X` and `Scale Y` values if you find that the mouse position is incorrectly offset when you zoom, which is due to the source being scaled differently than the monitor you are using.
+## Current Usage Model
 
-Example 1 - A 500x300 window positioned at the center of a single 1000x900 monitor, would need the following values:
-   * X = 250 (center of monitor X 500 - half width of window 250)
-   * Y = 300 (center of monitor Y 450 - half height of window 150)
-   * Width = 500 (window width)
-   * Height = 300 (window height)
+The script behaves like a virtual camera over the selected OBS source:
 
-Example 2 - A cloned display-capture source which is using the second 1920x1080 monitor of a two monitor side by side setup:
-   * X = 1921 (the left-most pixel position of the second monitor because it is immediately next to the other 1920 monitor)
-   * Y = 0 (the top-most pixel position of the monitor)
-   * Width = 1920 (monitor width)
-   * Height = 1080 (monitor height)
+```text
+cursor or remote target
+        |
+        v
+source-coordinate target
+        |
+        v
+eased crop animation
+        |
+        v
+OBS Crop/Pad filter update
+```
 
-Example 3 - A cloned scene source which is showing a 1920x1080 monitor but the scene canvas size is scaled down to 1024x768 setup:
-   * X = 0 (the left-most pixel position of the monitor)
-   * Y = 0 (the top-most pixel position of the monitor)
-   * Width = 1920 (monitor width)
-   * Height = 1080 (monitor height)
-   * Scale X = 0.53 (canvas width 1024 / monitor width 1920)
-   * Scale Y = 0.71 (canvas height 768 / monitor height 1080)
+When the zoom hotkey is pressed, the script optionally waits briefly for the cursor to settle, computes a target crop rectangle, and animates OBS's Crop/Pad filter toward that crop. Pressing the same hotkey again zooms back out.
 
-I don't know of an easy way of getting these values automatically otherwise I would just have the script do it for you.
+While zoomed in, follow mode can keep the cursor in view. The follow system includes a safe zone so the frame can stay stable while you move the cursor around the focused content.
 
-Note: If you are also using a `transform crop` on the non-display capture source, you will need to manually convert it to a `Crop/Pad Filter` instead (the script has trouble trying to auto convert it for you for non-display sources).
+## Main Controls
 
-## Known Limitations
-* Only works on `Display Capture` sources (automatically)
-   * In theory it should be able to work on window captures too, if there was a way to get the mouse position relative to that specific window
-   * You can now enable the [`Show all sources`](#More-information-on-'Show-All-Sources') option to select a non-display capture source, but you MUST set manual source position values
+The current script UI includes:
 
-* Using Linux:
-   * You may need to install the [loopback package](https://obsproject.com/forum/threads/obs-no-display-screen-capture-option.156314/) to enable `XSHM` display capture sources. This source acts most like the ones used by Windows and Mac so the script can auto calculate sizes for you.
-   * The script will also work with `Pipewire` sources, but you will need to enable `Allow any zoom source` and `Set manual source position` since the script cannot get the size by itself.
+- `Motion Preset`: `Tutorial`, `Quick Focus`, `Detailed Inspection`, `Energetic Demo`, `Reduced Motion`, or `Custom`.
+- `Zoom Factor`: how far to zoom in.
+- `Zoom In Duration (ms)` and `Zoom Out Duration (ms)`: duration-based animation timing.
+- `Zoom In Easing` and `Zoom Out Easing`: easing curves for the camera movement.
+- `Cursor settle before zoom`: short pre-zoom delay that avoids starting a zoom during fast cursor movement.
+- `Auto follow mouse`, `Follow Speed`, `Follow Border`, and `Lock Sensitivity`: safe-zone follow behavior while zoomed.
+- `Zoom Overshoot`: optional subtle settle for energetic demos.
+- `Scale Filter Policy`: optional helper for OBS scene-item scale filtering.
+- `Retina detection mode`: macOS coordinate handling for mixed point/pixel display setups.
+- `Allow any zoom source` and `Set manual source position`: advanced geometry controls for non-display or cloned sources.
+- `Enable remote mouse listener`: optional UDP control when `ljsocket.lua` is available.
 
-* Using Mac:
-   * When using `Set manual source position` you may need to set the `Monitor Height` value as it is used to invert the Y coordinate of the mouse position so that it matches the values of Windows and Linux that the script expects.
+Do not tune from this list alone. The recommended ranges, defaults, and troubleshooting paths are in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
-## Development Setup
-* Clone this repo
-* Edit `obs-zoom-to-mouse.lua`
-* Click `Reload Scripts` in the OBS Scripts window
+## Remote Targeting
 
-##
+If `ljsocket.lua` is installed next to the Lua script, the remote listener supports:
 
-Want to support me staying awake long enough to add some more features?
+```text
+x y
+```
+
+and:
+
+```text
+rect x y width height
+```
+
+Rectangle targets let an external controller ask OBS to frame an entire button, menu item, code block, chart region, or UI panel instead of only centering on a point. See the [remote targeting section](docs/USER_GUIDE.md#remote-mouse-and-rectangle-targeting) for details.
+
+## Development
+
+Edit `obs-zoom-to-mouse.lua`, then click `Reload Scripts` in the OBS Scripts window.
+
+Useful local checks:
+
+```sh
+python3 -m unittest discover -v
+luajit tests/obs_lua_smoke.lua
+luajit tests/obs_lua_target_rect.lua
+luajit tests/obs_lua_scale_overshoot.lua
+```
+
+Python is used here only for repository tests. The maintained OBS runtime is Lua.
+
+## Known Limits
+
+- Display-capture sources are the best-supported automatic path.
+- Non-display sources require manual geometry.
+- OBS Crop/Pad uses integer crop values, so the script cannot promise true subpixel crop motion.
+- The script sees captured pixels and cursor/remote coordinates; it does not semantically recognize UI controls by itself.
+- Scale-filter changes are opt-in because OBS persists scene-item scale filters in scene data.
+
+More detail lives in the [user guide](docs/USER_GUIDE.md) and [architecture guide](docs/LUA_SCRIPT_DESIGN_AND_ARCHITECTURE.md).
+
+## Support
+
+Want to support the original project author?
 
 <a href="https://www.buymeacoffee.com/blanksourcecode" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
-
