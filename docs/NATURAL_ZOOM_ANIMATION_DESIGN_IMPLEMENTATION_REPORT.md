@@ -44,13 +44,15 @@ Current implementation pass:
 | Tutorial preset motion validation | Complete | OBS live validation used the `Tutorial` preset at `1.45x`, `420ms` zoom-in, and `320ms` zoom-out for repeated hotkey cycles. |
 | Cursor coordination delay | Complete | Static contract tests verify the settings and pending wait state; live OBS validation confirmed the `150ms` cursor-stability wait before zoom-in. |
 | Phase 4A target rectangle support | Complete | Static contract tests and LuaJIT math tests verify source-coordinate rectangle crop derivation, edge clamping, large-rectangle behavior, and legacy point targeting. |
-| Phase 4B/4C scale-filter helper and overshoot | Deferred | These remain optional and should stay disabled by default unless recorded output proves the need. |
+| Phase 4B scale-filter helper | Complete | Static contract and LuaJIT tests verify the opt-in policy, default no-mutation behavior, recommendation logging, temporary Lanczos/Bicubic application, and restore path. |
+| Phase 4C subtle overshoot | Complete | Static contract and LuaJIT tests verify default-off professional presets, `Energetic Demo` subtle overshoot, anchor-preserving crop math, and the `82%` approach / `18%` settle split. |
 
 Verification commands used for the current pass:
 
 ```bash
 luajit tests/obs_lua_smoke.lua
 luajit tests/obs_lua_target_rect.lua
+luajit tests/obs_lua_scale_overshoot.lua
 python3 -m unittest discover -v
 PYTHONPYCACHEPREFIX=/private/tmp/obs-zoom-to-mouse-pycache python3 -m py_compile tests/test_lua_natural_zoom_animation.py
 python3 -B -m unittest tests.test_lua_natural_zoom_animation -v
@@ -397,7 +399,7 @@ Stop condition:
 
 ### Phase 4: Optional Advanced Polish
 
-Status: Researched against the local OBS Studio source checkout. Phase 4A target-rectangle support is implemented in the current branch; scale-filter automation, overshoot, timer/tick rewiring, and custom shader/plugin work remain optional and deferred until recorded validation proves they are needed.
+Status: Researched against the local OBS Studio source checkout. Phase 4A target-rectangle support, Phase 4B scale-filter helper, and Phase 4C subtle overshoot are implemented in the current branch. Timer/tick rewiring and custom shader/plugin work remain optional and deferred until recorded validation proves they are needed.
 
 OBS source-code findings below use paths relative to the OBS Studio source root:
 
@@ -415,8 +417,8 @@ OBS source-code findings below use paths relative to the OBS Studio source root:
 Scope:
 
 1. Add an optional target-rectangle camera path for remote/control integrations.
-2. Document OBS scale-filter recommendations, then optionally add an opt-in scale-filter helper.
-3. Add a subtle overshoot option only for energetic demos.
+2. Document OBS scale-filter recommendations and expose an opt-in scale-filter helper.
+3. Add a subtle overshoot option for energetic demos while keeping professional presets bounce-free.
 4. Defer custom shader/plugin work unless recorded output proves that the Crop/Pad path is the limiting factor.
 
 Recommended implementation order:
@@ -472,7 +474,9 @@ Recommended implementation order:
 
 2. OBS scale-filter guidance and optional helper
 
-   The first deliverable should be documentation, not automatic mutation.
+   Status: Implemented in the current branch.
+
+   The deliverable is intentionally opt-in. The default leaves OBS scene-item scale filtering untouched because OBS persists this as user-visible scene-item state.
 
    Recommended user-facing guidance:
 
@@ -481,7 +485,7 @@ Recommended implementation order:
    - Avoid `Point` unless recording pixel art.
    - `Area` is mainly useful for strong downscaling, not the primary zoom-in readability case.
 
-   Optional script helper, if implemented:
+   Implemented script helper:
 
    ```lua
    scale_filter_policy = "leave_unchanged" -- default
@@ -491,19 +495,23 @@ Recommended implementation order:
    -- "temporarily_set_bicubic"
    ```
 
-   Implementation guardrails:
+   Implementation details and guardrails:
 
-   - Verify `obs.obs_sceneitem_get_scale_filter`, `obs.obs_sceneitem_set_scale_filter`, and `obs.OBS_SCALE_LANCZOS` in the Lua smoke test before adding the setting.
-   - Store the original scene-item filter before changing it.
-   - Restore the original value in `release_sceneitem`, script unload, and source change paths.
+   - `Scale Filter Policy` exposes `leave_unchanged`, `recommend_in_log`, `temporarily_set_lanczos`, and `temporarily_set_bicubic`.
+   - The helper checks for `obs.obs_sceneitem_get_scale_filter`, `obs.obs_sceneitem_set_scale_filter`, `obs.OBS_SCALE_LANCZOS`, and `obs.OBS_SCALE_BICUBIC` before mutating scene-item state.
+   - `recommend_in_log` writes guidance without mutating the scene item.
+   - Temporary policies store the original scene-item filter before changing it.
+   - Temporary policies restore the original value through the shared release/source-change path before the scene item reference is released or replaced.
    - Keep the default as `leave_unchanged`, because OBS persists scene item scale filters in scene data.
-   - Add debug logging that says whether the script left the filter alone, recommended a value, or temporarily changed it.
+   - LuaJIT tests cover the recommendation path, temporary Lanczos application, and restore behavior with a stubbed OBS scene item.
 
 3. Subtle overshoot
 
-   Overshoot should remain style-specific, not professional-default behavior.
+   Status: Implemented in the current branch.
 
-   Suggested settings:
+   Overshoot remains style-specific, not professional-default behavior. It is available through `Zoom Overshoot` and `Overshoot Amount (%)`, but defaults off.
+
+   Implemented settings:
 
    ```lua
    overshoot_mode = "off" -- default
@@ -511,7 +519,7 @@ Recommended implementation order:
    overshoot_settle_ratio = 0.18
    ```
 
-   Recommended algorithm:
+   Implemented algorithm:
 
    1. Compute the normal final target crop.
    2. Compute the target anchor from the final crop and the target bias:
@@ -540,13 +548,17 @@ Recommended implementation order:
       | Approach | `82%` of zoom-in duration | Overshoot crop | `ease_out_quart` |
       | Settle | `18%` of zoom-in duration | Final crop | `ease_out_cubic` |
 
-   Guardrails:
+   Implementation details and guardrails:
 
-   - Enable only for `Energetic Demo` or a hidden advanced/custom setting.
+   - `Tutorial`, `Quick Focus`, `Detailed Inspection`, and `Reduced Motion` keep overshoot off.
+   - `Energetic Demo` enables `subtle` overshoot at `1.0%`.
+   - Custom settings can enable subtle overshoot, but the UI caps the amount at `2.0%`.
    - Cap overshoot at `1-2%`.
    - Do not use bounce or elastic easing curves for professional presets.
    - Do not overshoot zoom-out by default.
-   - Validate with a short recorded clip, because overshoot can look acceptable in preview but distracting after encoding.
+   - The animation locks to the target during the overshoot/settle pair so auto-follow does not retarget mid-settle.
+   - If clamping would move the requested anchor by more than `1px`, the script skips overshoot for that move. This avoids edge snap near source boundaries.
+   - Validate with a short recorded clip before making overshoot part of any default professional workflow, because overshoot can look acceptable in preview but distracting after encoding.
 
 4. Timer/tick polish
 
@@ -572,7 +584,7 @@ Recommended implementation order:
 Expected result:
 
 - Remote/control integrations can frame a whole UI region instead of only a cursor point.
-- OBS scale-filter behavior is documented clearly, with an opt-in helper available only if Lua binding verification passes.
+- OBS scale-filter behavior is documented clearly, and the opt-in helper preserves/restores the prior scene-item value when it temporarily changes OBS state.
 - Energetic demos can get a tiny sense of polish without introducing visible bounce into tutorial/professional presets.
 - The project keeps the low-maintenance Lua-only architecture unless recorded evidence justifies a native OBS plugin.
 
@@ -581,7 +593,7 @@ Stop condition:
 - Professional presets remain bounce-free.
 - `Tutorial`, `Quick Focus`, `Detailed Inspection`, and `Reduced Motion` never enable overshoot implicitly.
 - Target rectangles keep the requested rectangle visible after clamping.
-- Scale-filter helper defaults to no mutation and restores any temporary change.
+- Scale-filter helper defaults to no mutation, verifies Lua API symbol availability, and restores any temporary change.
 - Lua smoke tests cover any new OBS API symbols before the script depends on them.
 - Recorded validation shows no distracting bounce, edge snap, or text-quality regression after export.
 
