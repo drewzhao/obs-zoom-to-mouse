@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LUA_SCRIPT = ROOT / "obs-zoom-to-mouse.lua"
-REPORT = ROOT / "docs" / "NATURAL_ZOOM_ANIMATION_DESIGN_IMPLEMENTATION_REPORT.md"
+REPORT = ROOT / "docs" / "LUA_SCRIPT_DESIGN_AND_ARCHITECTURE.md"
 
 
 def read_lua() -> str:
