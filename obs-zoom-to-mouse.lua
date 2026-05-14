@@ -12,6 +12,7 @@ local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 local socket_available, socket = pcall(require, "ljsocket")
 local socket_server = nil
 local socket_mouse = nil
+local socket_target = nil
 
 local source_name = ""
 local source = nil
@@ -30,9 +31,8 @@ local zoom_info = {
     source_size = { width = 0, height = 0 },
     source_crop = { x = 0, y = 0, w = 0, h = 0 },
     source_crop_filter = { x = 0, y = 0, w = 0, h = 0 },
-    zoom_to = 2
+    zoom_to = 1.45
 }
-local zoom_time = 0
 local zoom_target = nil
 local locked_center = nil
 local locked_last_pos = nil
@@ -70,8 +70,12 @@ local follow_speed = 0.1
 local follow_border = 0
 local follow_safezone_sensitivity = 10
 local use_follow_auto_lock = false
-local zoom_value = 2
-local zoom_speed = 0.1
+local use_cursor_stability_delay = true
+local cursor_stability_duration_ms = 150
+local cursor_stability_max_wait_ms = 250
+local cursor_stability_threshold_px = 4
+local zoom_value = 1.45
+local legacy_zoom_speed = 0.06
 local allow_all_sources = false
 local use_monitor_override = false
 local monitor_override_x = 0
@@ -88,6 +92,107 @@ local socket_poll = 1000
 local debug_logs = false
 local is_obs_loaded = false
 local is_script_loaded = false
+
+local MotionPreset = {
+    Tutorial = "tutorial",
+    QuickFocus = "quick_focus",
+    DetailedInspection = "detailed_inspection",
+    EnergeticDemo = "energetic_demo",
+    ReducedMotion = "reduced_motion",
+    Custom = "custom",
+}
+
+local Easing = {
+    Linear = "linear",
+    EaseOutCubic = "ease_out_cubic",
+    EaseInOutCubic = "ease_in_out_cubic",
+    EaseOutQuart = "ease_out_quart",
+    EaseInOutQuart = "ease_in_out_quart",
+}
+
+local TargetKind = {
+    Point = "point",
+    Rect = "rect",
+}
+
+local ScaleFilterPolicy = {
+    LeaveUnchanged = "leave_unchanged",
+    RecommendInLog = "recommend_in_log",
+    TemporarilySetLanczos = "temporarily_set_lanczos",
+    TemporarilySetBicubic = "temporarily_set_bicubic",
+}
+
+local OvershootMode = {
+    Off = "off",
+    Subtle = "subtle",
+}
+
+local motion_preset = MotionPreset.Tutorial
+local zoom_in_duration_ms = 420
+local zoom_out_duration_ms = 320
+local zoom_in_easing = Easing.EaseOutCubic
+local zoom_out_easing = Easing.EaseInOutCubic
+local target_screen_x = 0.50
+local target_screen_y = 0.45
+local target_rect_margin = 1.18
+local scale_filter_policy = ScaleFilterPolicy.LeaveUnchanged
+local scale_filter_restore = {
+    active = false,
+    item = nil,
+    original_filter = nil,
+    target_filter = nil,
+}
+local overshoot_mode = OvershootMode.Off
+local overshoot_percent = 1.0
+local overshoot_settle_ratio = 0.18
+
+local MotionPresetSettings = {
+    [MotionPreset.Tutorial] = {
+        zoom_value = 1.45,
+        zoom_in_duration_ms = 420,
+        zoom_out_duration_ms = 320,
+        zoom_in_easing = Easing.EaseOutCubic,
+        zoom_out_easing = Easing.EaseInOutCubic,
+        overshoot_mode = OvershootMode.Off,
+        overshoot_percent = 1.0,
+    },
+    [MotionPreset.QuickFocus] = {
+        zoom_value = 1.35,
+        zoom_in_duration_ms = 280,
+        zoom_out_duration_ms = 240,
+        zoom_in_easing = Easing.EaseOutCubic,
+        zoom_out_easing = Easing.EaseOutCubic,
+        overshoot_mode = OvershootMode.Off,
+        overshoot_percent = 1.0,
+    },
+    [MotionPreset.DetailedInspection] = {
+        zoom_value = 1.75,
+        zoom_in_duration_ms = 500,
+        zoom_out_duration_ms = 360,
+        zoom_in_easing = Easing.EaseInOutCubic,
+        zoom_out_easing = Easing.EaseInOutCubic,
+        overshoot_mode = OvershootMode.Off,
+        overshoot_percent = 1.0,
+    },
+    [MotionPreset.EnergeticDemo] = {
+        zoom_value = 1.60,
+        zoom_in_duration_ms = 350,
+        zoom_out_duration_ms = 260,
+        zoom_in_easing = Easing.EaseOutQuart,
+        zoom_out_easing = Easing.EaseOutCubic,
+        overshoot_mode = OvershootMode.Subtle,
+        overshoot_percent = 1.0,
+    },
+    [MotionPreset.ReducedMotion] = {
+        zoom_value = 1.15,
+        zoom_in_duration_ms = 100,
+        zoom_out_duration_ms = 100,
+        zoom_in_easing = Easing.EaseOutCubic,
+        zoom_out_easing = Easing.EaseOutCubic,
+        overshoot_mode = OvershootMode.Off,
+        overshoot_percent = 1.0,
+    },
+}
 
 local RetinaMode = {
     Auto = "auto",
@@ -106,6 +211,28 @@ local ZoomState = {
     ZoomedIn = 3,
 }
 local zoom_state = ZoomState.None
+
+local camera_animation = {
+    active = false,
+    state = ZoomState.None,
+    from = { x = 0, y = 0, w = 0, h = 0 },
+    to = { x = 0, y = 0, w = 0, h = 0 },
+    elapsed_ms = 0,
+    duration_ms = 420,
+    easing = Easing.EaseOutCubic,
+    settle_to = nil,
+    settle_duration_ms = 0,
+    settle_easing = Easing.EaseOutCubic,
+    lock_target = false,
+}
+
+local cursor_zoom_pending = {
+    active = false,
+    elapsed_ms = 0,
+    stable_ms = 0,
+    last_center = nil,
+    target = nil,
+}
 
 local version = obs.obs_get_version_string()
 local major_str, minor_str, patch_str = version:match("(%d+)%.(%d+)%.(%d+)")
@@ -606,6 +733,518 @@ function clamp(min, max, value)
     return math.max(min, math.min(max, value))
 end
 
+function apply_easing(easing, t)
+    t = clamp(0, 1, t)
+
+    if easing == Easing.Linear then
+        return t
+    elseif easing == Easing.EaseOutCubic then
+        local inv = 1 - t
+        return 1 - inv * inv * inv
+    elseif easing == Easing.EaseOutQuart then
+        local inv = 1 - t
+        return 1 - inv * inv * inv * inv
+    elseif easing == Easing.EaseInOutQuart then
+        if t < 0.5 then
+            return 8 * t * t * t * t
+        end
+
+        local inv = -2 * t + 2
+        return 1 - (inv * inv * inv * inv) / 2
+    end
+
+    if t < 0.5 then
+        return 4 * t * t * t
+    end
+
+    return 1 - math.pow(-2 * t + 2, 3) / 2
+end
+
+local function normalize_easing(value, fallback)
+    if value == Easing.Linear or
+        value == Easing.EaseOutCubic or
+        value == Easing.EaseInOutCubic or
+        value == Easing.EaseOutQuart or
+        value == Easing.EaseInOutQuart then
+        return value
+    end
+
+    return fallback
+end
+
+local function normalize_motion_preset(value)
+    if value == MotionPreset.Tutorial or
+        value == MotionPreset.QuickFocus or
+        value == MotionPreset.DetailedInspection or
+        value == MotionPreset.EnergeticDemo or
+        value == MotionPreset.ReducedMotion or
+        value == MotionPreset.Custom then
+        return value
+    end
+
+    return MotionPreset.Tutorial
+end
+
+local function normalize_scale_filter_policy(value)
+    if value == ScaleFilterPolicy.LeaveUnchanged or
+        value == ScaleFilterPolicy.RecommendInLog or
+        value == ScaleFilterPolicy.TemporarilySetLanczos or
+        value == ScaleFilterPolicy.TemporarilySetBicubic then
+        return value
+    end
+
+    return ScaleFilterPolicy.LeaveUnchanged
+end
+
+local function normalize_overshoot_mode(value)
+    if value == OvershootMode.Off or value == OvershootMode.Subtle then
+        return value
+    end
+
+    return OvershootMode.Off
+end
+
+local function copy_crop(crop)
+    return {
+        x = crop.x or 0,
+        y = crop.y or 0,
+        w = crop.w or 0,
+        h = crop.h or 0,
+    }
+end
+
+local function get_animation_frame_interval_ms()
+    local interval_ns = obs.obs_get_frame_interval_ns()
+    if interval_ns ~= nil and interval_ns > 0 then
+        return interval_ns / 1000000
+    end
+
+    return 16.667
+end
+
+local function normalize_cursor_stability_settings()
+    cursor_stability_duration_ms = math.max(0, cursor_stability_duration_ms or 0)
+    cursor_stability_max_wait_ms = math.max(0, cursor_stability_max_wait_ms or 0)
+    cursor_stability_threshold_px = math.max(0, cursor_stability_threshold_px or 0)
+end
+
+local function normalize_overshoot_settings()
+    overshoot_mode = normalize_overshoot_mode(overshoot_mode)
+    overshoot_percent = clamp(0, 2, overshoot_percent or 0)
+    overshoot_settle_ratio = clamp(0.05, 0.40, overshoot_settle_ratio or 0.18)
+end
+
+local function add_easing_options(prop)
+    obs.obs_property_list_add_string(prop, "Linear", Easing.Linear)
+    obs.obs_property_list_add_string(prop, "Ease out cubic", Easing.EaseOutCubic)
+    obs.obs_property_list_add_string(prop, "Ease in/out cubic", Easing.EaseInOutCubic)
+    obs.obs_property_list_add_string(prop, "Ease out quart", Easing.EaseOutQuart)
+    obs.obs_property_list_add_string(prop, "Ease in/out quart", Easing.EaseInOutQuart)
+end
+
+local function add_motion_preset_options(prop)
+    obs.obs_property_list_add_string(prop, "Tutorial", MotionPreset.Tutorial)
+    obs.obs_property_list_add_string(prop, "Quick Focus", MotionPreset.QuickFocus)
+    obs.obs_property_list_add_string(prop, "Detailed Inspection", MotionPreset.DetailedInspection)
+    obs.obs_property_list_add_string(prop, "Energetic Demo", MotionPreset.EnergeticDemo)
+    obs.obs_property_list_add_string(prop, "Reduced Motion", MotionPreset.ReducedMotion)
+    obs.obs_property_list_add_string(prop, "Custom", MotionPreset.Custom)
+end
+
+local function add_scale_filter_policy_options(prop)
+    obs.obs_property_list_add_string(prop, "Leave unchanged", ScaleFilterPolicy.LeaveUnchanged)
+    obs.obs_property_list_add_string(prop, "Recommend in log", ScaleFilterPolicy.RecommendInLog)
+    obs.obs_property_list_add_string(prop, "Temporarily set Lanczos", ScaleFilterPolicy.TemporarilySetLanczos)
+    obs.obs_property_list_add_string(prop, "Temporarily set Bicubic", ScaleFilterPolicy.TemporarilySetBicubic)
+end
+
+local function add_overshoot_options(prop)
+    obs.obs_property_list_add_string(prop, "Off", OvershootMode.Off)
+    obs.obs_property_list_add_string(prop, "Subtle", OvershootMode.Subtle)
+end
+
+local function apply_motion_preset_to_settings(settings, preset)
+    local preset_settings = MotionPresetSettings[preset]
+    if preset_settings == nil then
+        return
+    end
+
+    obs.obs_data_set_double(settings, "zoom_value", preset_settings.zoom_value)
+    obs.obs_data_set_int(settings, "zoom_in_duration_ms", preset_settings.zoom_in_duration_ms)
+    obs.obs_data_set_int(settings, "zoom_out_duration_ms", preset_settings.zoom_out_duration_ms)
+    obs.obs_data_set_string(settings, "zoom_in_easing", preset_settings.zoom_in_easing)
+    obs.obs_data_set_string(settings, "zoom_out_easing", preset_settings.zoom_out_easing)
+    obs.obs_data_set_string(settings, "overshoot_mode", preset_settings.overshoot_mode)
+    obs.obs_data_set_double(settings, "overshoot_percent", preset_settings.overshoot_percent)
+end
+
+local function settings_has_user_value(settings, name)
+    if obs.obs_data_has_user_value == nil then
+        return false
+    end
+
+    return obs.obs_data_has_user_value(settings, name)
+end
+
+local function migrate_legacy_motion_preset(settings)
+    if settings_has_user_value(settings, "motion_preset") then
+        return
+    end
+
+    if settings_has_user_value(settings, "zoom_value") or
+        settings_has_user_value(settings, "zoom_speed") then
+        obs.obs_data_set_string(settings, "motion_preset", MotionPreset.Custom)
+    end
+end
+
+function scale_filter_api_available()
+    return type(obs.obs_sceneitem_get_scale_filter) == "function" and
+        type(obs.obs_sceneitem_set_scale_filter) == "function" and
+        type(obs.OBS_SCALE_LANCZOS) == "number" and
+        type(obs.OBS_SCALE_BICUBIC) == "number"
+end
+
+function scale_filter_policy_to_filter(policy)
+    policy = normalize_scale_filter_policy(policy)
+
+    if policy == ScaleFilterPolicy.TemporarilySetLanczos then
+        return obs.OBS_SCALE_LANCZOS
+    elseif policy == ScaleFilterPolicy.TemporarilySetBicubic then
+        return obs.OBS_SCALE_BICUBIC
+    end
+
+    return nil
+end
+
+function apply_scale_filter_policy_to_item(item, policy)
+    policy = normalize_scale_filter_policy(policy)
+
+    local result = {
+        policy = policy,
+        applied = false,
+        original_filter = nil,
+        target_filter = nil,
+    }
+
+    if item == nil or policy == ScaleFilterPolicy.LeaveUnchanged then
+        return result
+    end
+
+    if policy == ScaleFilterPolicy.RecommendInLog then
+        obs.script_log(obs.OBS_LOG_INFO,
+            "Scale filter recommendation: try Lanczos for sharper zoomed text, or Bicubic if Lanczos looks too sharp.")
+        return result
+    end
+
+    if not scale_filter_api_available() then
+        log("Scale filter policy skipped because this OBS Lua runtime does not expose scene item scale filter APIs.")
+        return result
+    end
+
+    local target_filter = scale_filter_policy_to_filter(policy)
+    if target_filter == nil then
+        return result
+    end
+
+    local original_filter = obs.obs_sceneitem_get_scale_filter(item)
+    result.original_filter = original_filter
+    result.target_filter = target_filter
+
+    if original_filter ~= target_filter then
+        obs.obs_sceneitem_set_scale_filter(item, target_filter)
+        result.applied = true
+        log("Temporarily applied zoom scale filter policy: " .. policy)
+    end
+
+    return result
+end
+
+function restore_scale_filter_policy_for_item(item, state)
+    if item == nil or state == nil or (state.applied ~= true and state.active ~= true) then
+        return false
+    end
+
+    if state.original_filter == nil then
+        return false
+    end
+
+    if not scale_filter_api_available() then
+        return false
+    end
+
+    obs.obs_sceneitem_set_scale_filter(item, state.original_filter)
+    return true
+end
+
+function restore_scale_filter_policy()
+    if scale_filter_restore.active ~= true then
+        return false
+    end
+
+    local restored = restore_scale_filter_policy_for_item(scale_filter_restore.item, scale_filter_restore)
+    if restored then
+        log("Restored original scene item scale filter")
+    end
+
+    scale_filter_restore.active = false
+    scale_filter_restore.item = nil
+    scale_filter_restore.original_filter = nil
+    scale_filter_restore.target_filter = nil
+
+    return restored
+end
+
+function apply_scale_filter_policy()
+    restore_scale_filter_policy()
+
+    local applied = apply_scale_filter_policy_to_item(sceneitem, scale_filter_policy)
+    if applied.applied then
+        scale_filter_restore.active = true
+        scale_filter_restore.item = sceneitem
+        scale_filter_restore.original_filter = applied.original_filter
+        scale_filter_restore.target_filter = applied.target_filter
+    end
+
+    return applied
+end
+
+function start_zoom_timer()
+    if is_timer_running == false then
+        is_timer_running = true
+        local timer_interval = math.floor(get_animation_frame_interval_ms())
+        if timer_interval < 1 then
+            timer_interval = 1
+        end
+        obs.timer_add(on_timer, timer_interval)
+    end
+end
+
+local function reset_cursor_zoom_pending()
+    cursor_zoom_pending.active = false
+    cursor_zoom_pending.elapsed_ms = 0
+    cursor_zoom_pending.stable_ms = 0
+    cursor_zoom_pending.last_center = nil
+    cursor_zoom_pending.target = nil
+end
+
+function stop_zoom_timer_if_idle()
+    if is_timer_running and camera_animation.active == false and
+        cursor_zoom_pending.active == false and is_following_mouse == false then
+        is_timer_running = false
+        obs.timer_remove(on_timer)
+    end
+end
+
+function start_crop_animation(state, from_crop, to_crop, duration_ms, easing, options)
+    options = options or {}
+
+    camera_animation.active = true
+    camera_animation.state = state
+    camera_animation.from = copy_crop(from_crop)
+    camera_animation.to = copy_crop(to_crop)
+    camera_animation.elapsed_ms = 0
+    camera_animation.duration_ms = math.max(1, duration_ms or 1)
+    camera_animation.easing = normalize_easing(easing, Easing.EaseOutCubic)
+    camera_animation.settle_to = options.settle_to and copy_crop(options.settle_to) or nil
+    camera_animation.settle_duration_ms = math.max(1, options.settle_duration_ms or 1)
+    camera_animation.settle_easing = normalize_easing(options.settle_easing, Easing.EaseOutCubic)
+    camera_animation.lock_target = options.lock_target == true
+    zoom_state = state
+    start_zoom_timer()
+end
+
+function update_crop_animation(elapsed_ms)
+    if camera_animation.active == false then
+        return false
+    end
+
+    if camera_animation.state == ZoomState.ZoomingIn and use_auto_follow_mouse and not camera_animation.lock_target then
+        zoom_target = get_target_position(zoom_info)
+        camera_animation.to = copy_crop(zoom_target.crop)
+    end
+
+    camera_animation.elapsed_ms = camera_animation.elapsed_ms + elapsed_ms
+    local t = clamp(0, 1, camera_animation.elapsed_ms / camera_animation.duration_ms)
+    local eased = apply_easing(camera_animation.easing, t)
+
+    crop_filter_info.x = lerp(camera_animation.from.x, camera_animation.to.x, eased)
+    crop_filter_info.y = lerp(camera_animation.from.y, camera_animation.to.y, eased)
+    crop_filter_info.w = lerp(camera_animation.from.w, camera_animation.to.w, eased)
+    crop_filter_info.h = lerp(camera_animation.from.h, camera_animation.to.h, eased)
+    set_crop_settings(crop_filter_info)
+
+    if t >= 1 then
+        crop_filter_info.x = camera_animation.to.x
+        crop_filter_info.y = camera_animation.to.y
+        crop_filter_info.w = camera_animation.to.w
+        crop_filter_info.h = camera_animation.to.h
+        set_crop_settings(crop_filter_info)
+
+        if camera_animation.state == ZoomState.ZoomingIn and camera_animation.settle_to ~= nil then
+            local settle_to = copy_crop(camera_animation.settle_to)
+            camera_animation.from = copy_crop(camera_animation.to)
+            camera_animation.to = settle_to
+            camera_animation.elapsed_ms = 0
+            camera_animation.duration_ms = camera_animation.settle_duration_ms
+            camera_animation.easing = camera_animation.settle_easing
+            camera_animation.settle_to = nil
+            camera_animation.lock_target = true
+            return true
+        end
+
+        local completed_state = camera_animation.state
+        camera_animation.active = false
+        camera_animation.lock_target = false
+
+        if completed_state == ZoomState.ZoomingOut then
+            log("Zoomed out")
+            zoom_state = ZoomState.None
+            locked_center = nil
+            locked_last_pos = nil
+            stop_zoom_timer_if_idle()
+        elseif completed_state == ZoomState.ZoomingIn then
+            log("Zoomed in")
+            zoom_state = ZoomState.ZoomedIn
+
+            if use_auto_follow_mouse then
+                is_following_mouse = true
+                log("Tracking mouse is " .. (is_following_mouse and "on" or "off") .. " (due to auto follow)")
+            end
+
+            if is_following_mouse and follow_border < 50 then
+                zoom_target = get_target_position(zoom_info)
+                locked_center = { x = zoom_target.clamped_center.x, y = zoom_target.clamped_center.y }
+                log("Cursor stopped. Tracking locked to " .. locked_center.x .. ", " .. locked_center.y)
+            end
+
+            stop_zoom_timer_if_idle()
+        end
+    end
+
+    return camera_animation.active
+end
+
+local function copy_center(center)
+    if center == nil then
+        return nil
+    end
+
+    return { x = center.x or 0, y = center.y or 0 }
+end
+
+local function should_wait_for_cursor_stability()
+    normalize_cursor_stability_settings()
+
+    return use_cursor_stability_delay and
+        cursor_stability_duration_ms > 0 and
+        cursor_stability_max_wait_ms > 0
+end
+
+function start_zoom_in_animation(target)
+    zoom_info.zoom_to = zoom_value
+    locked_center = nil
+    locked_last_pos = nil
+    zoom_target = target or get_target_position(zoom_info)
+
+    local overshoot_options = create_overshoot_animation_options(zoom_info, zoom_target.crop, zoom_in_duration_ms)
+    if overshoot_options ~= nil then
+        start_crop_animation(ZoomState.ZoomingIn, crop_filter_info, overshoot_options.approach_to,
+            overshoot_options.approach_duration_ms, overshoot_options.approach_easing, {
+                settle_to = copy_crop(overshoot_options.settle_to),
+                settle_duration_ms = overshoot_options.settle_duration_ms,
+                settle_easing = overshoot_options.settle_easing,
+                lock_target = true,
+            })
+        return
+    end
+
+    start_crop_animation(ZoomState.ZoomingIn, crop_filter_info, zoom_target.crop, zoom_in_duration_ms, zoom_in_easing)
+end
+
+function start_pending_zoom_in()
+    reset_cursor_zoom_pending()
+    zoom_info.zoom_to = zoom_value
+    zoom_target = get_target_position(zoom_info)
+
+    cursor_zoom_pending.active = true
+    cursor_zoom_pending.target = zoom_target
+    cursor_zoom_pending.last_center = copy_center(zoom_target.raw_center)
+    zoom_state = ZoomState.ZoomingIn
+
+    log("Cursor stability wait started (" ..
+        "stable=" .. cursor_stability_duration_ms .. "ms, " ..
+        "max=" .. cursor_stability_max_wait_ms .. "ms, " ..
+        "threshold=" .. cursor_stability_threshold_px .. "px)")
+
+    start_zoom_timer()
+end
+
+local function finish_pending_zoom_in(message)
+    local target = cursor_zoom_pending.target
+    reset_cursor_zoom_pending()
+    log(message)
+    start_zoom_in_animation(target)
+end
+
+function update_cursor_stability_delay(elapsed_ms)
+    if cursor_zoom_pending.active == false then
+        return false
+    end
+
+    elapsed_ms = elapsed_ms or get_animation_frame_interval_ms()
+    cursor_zoom_pending.elapsed_ms = cursor_zoom_pending.elapsed_ms + elapsed_ms
+    zoom_info.zoom_to = zoom_value
+
+    local current_target = get_target_position(zoom_info)
+    local current_center = current_target.raw_center
+    local last_center = cursor_zoom_pending.last_center
+
+    if last_center ~= nil and current_center ~= nil then
+        local dx = math.abs((current_center.x or 0) - (last_center.x or 0))
+        local dy = math.abs((current_center.y or 0) - (last_center.y or 0))
+
+        if dx <= cursor_stability_threshold_px and dy <= cursor_stability_threshold_px then
+            cursor_zoom_pending.stable_ms = cursor_zoom_pending.stable_ms + elapsed_ms
+        else
+            if cursor_zoom_pending.stable_ms > 0 then
+                log("Cursor moved " .. math.floor(dx) .. "x" .. math.floor(dy) ..
+                    "px; resetting stability wait")
+            end
+            cursor_zoom_pending.stable_ms = 0
+        end
+    end
+
+    cursor_zoom_pending.last_center = copy_center(current_center)
+    cursor_zoom_pending.target = current_target
+
+    if cursor_zoom_pending.stable_ms >= cursor_stability_duration_ms then
+        finish_pending_zoom_in("Cursor stable for " ..
+            math.floor(cursor_zoom_pending.stable_ms) .. "ms; starting zoom")
+        return true
+    end
+
+    if cursor_zoom_pending.elapsed_ms >= cursor_stability_max_wait_ms then
+        finish_pending_zoom_in("Cursor stability wait capped at " ..
+            math.floor(cursor_zoom_pending.elapsed_ms) .. "ms; starting zoom")
+        return true
+    end
+
+    return true
+end
+
+function begin_zoom_in()
+    zoom_info.zoom_to = zoom_value
+    locked_center = nil
+    locked_last_pos = nil
+
+    if should_wait_for_cursor_stability() then
+        start_pending_zoom_in()
+        return
+    end
+
+    start_zoom_in_animation()
+end
+
 local function retina_log(message)
     if debug_logs then
         log("[Retina] " .. message)
@@ -983,8 +1622,12 @@ function release_sceneitem()
     end
 
     zoom_state = ZoomState.None
+    camera_animation.active = false
+    reset_cursor_zoom_pending()
 
     if sceneitem ~= nil then
+        restore_scale_filter_policy()
+
         if crop_filter ~= nil and source ~= nil then
             log("Zoom crop filter removed")
             obs.obs_source_filter_remove(source, crop_filter)
@@ -1277,6 +1920,7 @@ function refresh_sceneitem(find_newest)
 
         obs.obs_source_filter_set_order(source, crop_filter, obs.OBS_ORDER_MOVE_BOTTOM)
         set_crop_settings(crop_filter_info_orig)
+        apply_scale_filter_policy()
     end
 end
 
@@ -1284,7 +1928,55 @@ end
 -- Get the target position that we will attempt to zoom towards
 ---@param zoom any
 ---@return table
-function get_target_position(zoom)
+local function get_source_size(zoom)
+    local width = zoom.source_size.width or 0
+    local height = zoom.source_size.height or 0
+
+    if width < 1 then
+        width = 1
+    end
+    if height < 1 then
+        height = 1
+    end
+
+    return width, height
+end
+
+local function get_safe_zoom_factor(zoom)
+    local factor = zoom.zoom_to or 1
+    if factor < 1 then
+        factor = 1
+    end
+
+    return factor
+end
+
+function clamp_crop_to_source_bounds(zoom, crop)
+    local source_width, source_height = get_source_size(zoom)
+
+    crop.w = clamp(1, source_width, crop.w)
+    crop.h = clamp(1, source_height, crop.h)
+    crop.x = math.floor(clamp(0, math.max(0, source_width - crop.w), crop.x))
+    crop.y = math.floor(clamp(0, math.max(0, source_height - crop.h), crop.y))
+
+    return crop
+end
+
+local function target_result(zoom, crop, raw_center, kind)
+    crop = clamp_crop_to_source_bounds(zoom, crop)
+
+    return {
+        crop = crop,
+        raw_center = raw_center,
+        clamped_center = {
+            x = math.floor(crop.x + crop.w * 0.5),
+            y = math.floor(crop.y + crop.h * 0.5)
+        },
+        target_kind = kind,
+    }
+end
+
+function get_mouse_source_point(zoom)
     local mouse = get_mouse_pos()
 
     -- If we have monitor information then we can offset the mouse by the top-left of the monitor position
@@ -1316,18 +2008,35 @@ function get_target_position(zoom)
         mouse.y = mouse.y * monitor_info.scale_y
     end
 
+    return mouse
+end
+
+function get_point_target_position(zoom, target)
+    local point
+    if target ~= nil and target.coordinate_space == "source" then
+        point = {
+            x = target.x or 0,
+            y = target.y or 0,
+        }
+    else
+        point = get_mouse_source_point(zoom)
+    end
+
+    local source_width, source_height = get_source_size(zoom)
+    local zoom_factor = get_safe_zoom_factor(zoom)
+
     -- Get the new size after we zoom
     -- Remember that because we are using a crop/pad filter making the size smaller (dividing by zoom) means that we see less of the image
     -- in the same amount of space making it look bigger (aka zoomed in)
     local new_size = {
-        width = zoom.source_size.width / zoom.zoom_to,
-        height = zoom.source_size.height / zoom.zoom_to
+        width = source_width / zoom_factor,
+        height = source_height / zoom_factor
     }
 
-    -- New offset for the crop/pad filter is whereever we clicked minus half the size, so that the clicked point because the new center
+    -- Frame the target slightly above center by default so tutorial content has a more natural resting position.
     local pos = {
-        x = mouse.x - new_size.width * 0.5,
-        y = mouse.y - new_size.height * 0.5
+        x = point.x - new_size.width * target_screen_x,
+        y = point.y - new_size.height * target_screen_y
     }
 
     -- Create the full crop results
@@ -1338,11 +2047,122 @@ function get_target_position(zoom)
         h = new_size.height,
     }
 
-    -- Keep the zoom in bounds of the source so that we never show something outside that user is trying to hide with existing crop settings
-    crop.x = math.floor(clamp(0, (zoom.source_size.width - new_size.width), crop.x))
-    crop.y = math.floor(clamp(0, (zoom.source_size.height - new_size.height), crop.y))
+    return target_result(zoom, crop, point, TargetKind.Point)
+end
 
-    return { crop = crop, raw_center = mouse, clamped_center = { x = math.floor(crop.x + crop.w * 0.5), y = math.floor(crop.y + crop.h * 0.5) } }
+function get_rect_target_position(zoom, target)
+    if target == nil or target.w == nil or target.h == nil or target.w <= 0 or target.h <= 0 then
+        return get_point_target_position(zoom, target)
+    end
+
+    local source_width, source_height = get_source_size(zoom)
+    local source_aspect = source_width / source_height
+    local zoom_factor = get_safe_zoom_factor(zoom)
+    local margin = target_rect_margin or 1.18
+
+    local rect_w = math.max(1, target.w or 1)
+    local rect_h = math.max(1, target.h or 1)
+    local min_w = rect_w * margin
+    local min_h = rect_h * margin
+    local crop_w = math.max(source_width / zoom_factor, min_w, min_h * source_aspect)
+
+    crop_w = clamp(1, source_width, crop_w)
+    local crop_h = crop_w / source_aspect
+
+    local anchor = {
+        x = (target.x or 0) + rect_w * 0.5,
+        y = (target.y or 0) + rect_h * 0.5,
+    }
+
+    local crop = {
+        x = anchor.x - crop_w * target_screen_x,
+        y = anchor.y - crop_h * target_screen_y,
+        w = crop_w,
+        h = crop_h,
+    }
+
+    return target_result(zoom, crop, anchor, TargetKind.Rect)
+end
+
+function get_target_position_for_target(zoom, target)
+    if target ~= nil and target.kind == TargetKind.Rect then
+        return get_rect_target_position(zoom, target)
+    end
+
+    if target ~= nil and target.kind == TargetKind.Point then
+        return get_point_target_position(zoom, target)
+    end
+
+    return get_point_target_position(zoom, nil)
+end
+
+function get_target_position(zoom)
+    return get_target_position_for_target(zoom, socket_target)
+end
+
+function build_overshoot_crop(zoom, final_crop, percent)
+    percent = clamp(0, 2, percent or overshoot_percent or 0)
+    if percent <= 0 then
+        return nil
+    end
+
+    local overshoot_scale = 1.0 + percent / 100.0
+    local anchor = {
+        x = final_crop.x + final_crop.w * target_screen_x,
+        y = final_crop.y + final_crop.h * target_screen_y,
+    }
+
+    local crop = {
+        w = final_crop.w / overshoot_scale,
+        h = final_crop.h / overshoot_scale,
+    }
+    crop.x = anchor.x - crop.w * target_screen_x
+    crop.y = anchor.y - crop.h * target_screen_y
+
+    crop = clamp_crop_to_source_bounds(zoom, crop)
+
+    local clamped_anchor = {
+        x = crop.x + crop.w * target_screen_x,
+        y = crop.y + crop.h * target_screen_y,
+    }
+
+    if math.abs(clamped_anchor.x - anchor.x) > 1 or math.abs(clamped_anchor.y - anchor.y) > 1 then
+        return nil
+    end
+
+    return crop
+end
+
+function create_overshoot_animation_options(zoom, final_crop, duration_ms, mode, percent, settle_ratio)
+    mode = normalize_overshoot_mode(mode or overshoot_mode)
+    percent = clamp(0, 2, percent or overshoot_percent or 0)
+    settle_ratio = clamp(0.05, 0.40, settle_ratio or overshoot_settle_ratio or 0.18)
+    duration_ms = math.max(1, duration_ms or 1)
+
+    if mode ~= OvershootMode.Subtle or percent <= 0 then
+        return nil
+    end
+
+    local overshoot_crop = build_overshoot_crop(zoom, final_crop, percent)
+    if overshoot_crop == nil then
+        return nil
+    end
+
+    local settle_duration_ms = math.max(1, math.floor(duration_ms * settle_ratio + 0.5))
+    local approach_duration_ms = math.max(1, duration_ms - settle_duration_ms)
+    if approach_duration_ms < 1 or settle_duration_ms < 1 then
+        return nil
+    end
+
+    return {
+        approach_to = copy_crop(overshoot_crop),
+        approach_duration_ms = approach_duration_ms,
+        approach_easing = Easing.EaseOutQuart,
+        settle_to = copy_crop(final_crop),
+        settle_duration_ms = settle_duration_ms,
+        settle_easing = Easing.EaseOutCubic,
+        lock_target = true,
+    }
 end
 
 function on_toggle_follow(pressed)
@@ -1351,12 +2171,9 @@ function on_toggle_follow(pressed)
         log("Tracking mouse is " .. (is_following_mouse and "on" or "off"))
 
         if is_following_mouse and zoom_state == ZoomState.ZoomedIn then
-            -- Since we are zooming we need to start the timer for the animation and tracking
-            if is_timer_running == false then
-                is_timer_running = true
-                local timer_interval = math.floor(obs.obs_get_frame_interval_ns() / 1000000)
-                obs.timer_add(on_timer, timer_interval)
-            end
+            start_zoom_timer()
+        elseif is_following_mouse == false then
+            stop_zoom_timer_if_idle()
         end
     end
 end
@@ -1368,172 +2185,124 @@ function on_toggle_zoom(pressed)
             if zoom_state == ZoomState.ZoomedIn then
                 log("Zooming out")
                 -- To zoom out, we set the target back to whatever it was originally
-                zoom_state = ZoomState.ZoomingOut
-                zoom_time = 0
+                reset_cursor_zoom_pending()
                 locked_center = nil
                 locked_last_pos = nil
-                zoom_target = { crop = crop_filter_info_orig, c = sceneitem_crop_orig }
+                zoom_target = { crop = copy_crop(crop_filter_info_orig), c = sceneitem_crop_orig }
                 if is_following_mouse then
                     is_following_mouse = false
                     log("Tracking mouse is off (due to zoom out)")
                 end
+
+                start_crop_animation(ZoomState.ZoomingOut, crop_filter_info, zoom_target.crop, zoom_out_duration_ms, zoom_out_easing)
             else
                 log("Zooming in")
-                -- To zoom in, we get a new target based on where the mouse was when zoom was clicked
-                zoom_state = ZoomState.ZoomingIn
-                zoom_info.zoom_to = zoom_value
-                zoom_time = 0
-                locked_center = nil
-                locked_last_pos = nil
-                zoom_target = get_target_position(zoom_info)
-            end
-
-            -- Since we are zooming we need to start the timer for the animation and tracking
-            if is_timer_running == false then
-                is_timer_running = true
-                local timer_interval = math.floor(obs.obs_get_frame_interval_ns() / 1000000)
-                obs.timer_add(on_timer, timer_interval)
+                begin_zoom_in()
             end
         end
     end
 end
 
-function on_timer()
-    if crop_filter_info ~= nil and zoom_target ~= nil then
-        -- Update our zoom time that we use for the animation
-        zoom_time = zoom_time + zoom_speed
+function on_timer(elapsed_ms)
+    if crop_filter_info == nil then
+        return
+    end
 
-        if zoom_state == ZoomState.ZoomingOut or zoom_state == ZoomState.ZoomingIn then
-            -- When we are doing a zoom animation (in or out) we linear interpolate the crop to the target
-            if zoom_time <= 1 then
-                -- If we have auto-follow turned on, make sure to keep the mouse in the view while we zoom
-                -- This is incase the user is moving the mouse a lot while the animation (which may be slow) is playing
-                if zoom_state == ZoomState.ZoomingIn and use_auto_follow_mouse then
-                    zoom_target = get_target_position(zoom_info)
+    elapsed_ms = elapsed_ms or get_animation_frame_interval_ms()
+
+    if cursor_zoom_pending.active then
+        update_cursor_stability_delay(elapsed_ms)
+        return
+    end
+
+    if camera_animation.active then
+        update_crop_animation(elapsed_ms)
+        return
+    end
+
+    -- If we are not zooming we only move the x/y to follow the mouse (width/height stay constant)
+    if is_following_mouse then
+        zoom_target = get_target_position(zoom_info)
+
+        local skip_frame = false
+        if not use_follow_outside_bounds then
+            if zoom_target.raw_center.x < zoom_target.crop.x or
+                zoom_target.raw_center.x > zoom_target.crop.x + zoom_target.crop.w or
+                zoom_target.raw_center.y < zoom_target.crop.y or
+                zoom_target.raw_center.y > zoom_target.crop.y + zoom_target.crop.h then
+                -- Don't follow the mouse if we are outside the bounds of the source
+                skip_frame = true
+            end
+        end
+
+        if not skip_frame then
+            -- If we have a locked_center it means we are currently in a locked zone and
+            -- shouldn't track the mouse until it moves out of the area
+            if locked_center ~= nil then
+                local diff = {
+                    x = zoom_target.raw_center.x - locked_center.x,
+                    y = zoom_target.raw_center.y - locked_center.y
+                }
+
+                local track = {
+                    x = zoom_target.crop.w * (0.5 - (follow_border * 0.01)),
+                    y = zoom_target.crop.h * (0.5 - (follow_border * 0.01))
+                }
+
+                if math.abs(diff.x) > track.x or math.abs(diff.y) > track.y then
+                    -- Cursor moved into the active border area, so resume tracking by clearing out the locked_center
+                    locked_center = nil
+                    locked_last_pos = {
+                        x = zoom_target.raw_center.x,
+                        y = zoom_target.raw_center.y,
+                        diff_x = diff.x,
+                        diff_y = diff.y
+                    }
+                    log("Locked area exited - resume tracking")
                 end
-                crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, ease_in_out(zoom_time))
-                crop_filter_info.y = lerp(crop_filter_info.y, zoom_target.crop.y, ease_in_out(zoom_time))
-                crop_filter_info.w = lerp(crop_filter_info.w, zoom_target.crop.w, ease_in_out(zoom_time))
-                crop_filter_info.h = lerp(crop_filter_info.h, zoom_target.crop.h, ease_in_out(zoom_time))
+            end
+
+            if locked_center == nil and (zoom_target.crop.x ~= crop_filter_info.x or zoom_target.crop.y ~= crop_filter_info.y) then
+                crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, follow_speed)
+                crop_filter_info.y = lerp(crop_filter_info.y, zoom_target.crop.y, follow_speed)
                 set_crop_settings(crop_filter_info)
-            end
-        else
-            -- If we are not zooming we only move the x/y to follow the mouse (width/height stay constant)
-            if is_following_mouse then
-                zoom_target = get_target_position(zoom_info)
 
-                local skip_frame = false
-                if not use_follow_outside_bounds then
-                    if zoom_target.raw_center.x < zoom_target.crop.x or
-                        zoom_target.raw_center.x > zoom_target.crop.x + zoom_target.crop.w or
-                        zoom_target.raw_center.y < zoom_target.crop.y or
-                        zoom_target.raw_center.y > zoom_target.crop.y + zoom_target.crop.h then
-                        -- Don't follow the mouse if we are outside the bounds of the source
-                        skip_frame = true
-                    end
-                end
+                -- Check to see if the mouse has stopped moving long enough to create a new safe zone
+                if is_following_mouse and locked_center == nil and locked_last_pos ~= nil then
+                    local diff = {
+                        x = math.abs(crop_filter_info.x - zoom_target.crop.x),
+                        y = math.abs(crop_filter_info.y - zoom_target.crop.y),
+                        auto_x = zoom_target.raw_center.x - locked_last_pos.x,
+                        auto_y = zoom_target.raw_center.y - locked_last_pos.y
+                    }
 
-                if not skip_frame then
-                    -- If we have a locked_center it means we are currently in a locked zone and
-                    -- shouldn't track the mouse until it moves out of the area
-                    if locked_center ~= nil then
-                        local diff = {
-                            x = zoom_target.raw_center.x - locked_center.x,
-                            y = zoom_target.raw_center.y - locked_center.y
-                        }
+                    locked_last_pos.x = zoom_target.raw_center.x
+                    locked_last_pos.y = zoom_target.raw_center.y
 
-                        local track = {
-                            x = zoom_target.crop.w * (0.5 - (follow_border * 0.01)),
-                            y = zoom_target.crop.h * (0.5 - (follow_border * 0.01))
-                        }
-
-                        if math.abs(diff.x) > track.x or math.abs(diff.y) > track.y then
-                            -- Cursor moved into the active border area, so resume tracking by clearing out the locked_center
-                            locked_center = nil
-                            locked_last_pos = {
-                                x = zoom_target.raw_center.x,
-                                y = zoom_target.raw_center.y,
-                                diff_x = diff.x,
-                                diff_y = diff.y
-                            }
-                            log("Locked area exited - resume tracking")
+                    local lock = false
+                    if math.abs(locked_last_pos.diff_x) > math.abs(locked_last_pos.diff_y) then
+                        if (diff.auto_x < 0 and locked_last_pos.diff_x > 0) or (diff.auto_x > 0 and locked_last_pos.diff_x < 0) then
+                            lock = true
+                        end
+                    else
+                        if (diff.auto_y < 0 and locked_last_pos.diff_y > 0) or (diff.auto_y > 0 and locked_last_pos.diff_y < 0) then
+                            lock = true
                         end
                     end
 
-                    if locked_center == nil and (zoom_target.crop.x ~= crop_filter_info.x or zoom_target.crop.y ~= crop_filter_info.y) then
-                        crop_filter_info.x = lerp(crop_filter_info.x, zoom_target.crop.x, follow_speed)
-                        crop_filter_info.y = lerp(crop_filter_info.y, zoom_target.crop.y, follow_speed)
-                        set_crop_settings(crop_filter_info)
-
-                        -- Check to see if the mouse has stopped moving long enough to create a new safe zone
-                        if is_following_mouse and locked_center == nil and locked_last_pos ~= nil then
-                            local diff = {
-                                x = math.abs(crop_filter_info.x - zoom_target.crop.x),
-                                y = math.abs(crop_filter_info.y - zoom_target.crop.y),
-                                auto_x = zoom_target.raw_center.x - locked_last_pos.x,
-                                auto_y = zoom_target.raw_center.y - locked_last_pos.y
-                            }
-
-                            locked_last_pos.x = zoom_target.raw_center.x
-                            locked_last_pos.y = zoom_target.raw_center.y
-
-                            local lock = false
-                            if math.abs(locked_last_pos.diff_x) > math.abs(locked_last_pos.diff_y) then
-                                if (diff.auto_x < 0 and locked_last_pos.diff_x > 0) or (diff.auto_x > 0 and locked_last_pos.diff_x < 0) then
-                                    lock = true
-                                end
-                            else
-                                if (diff.auto_y < 0 and locked_last_pos.diff_y > 0) or (diff.auto_y > 0 and locked_last_pos.diff_y < 0) then
-                                    lock = true
-                                end
-                            end
-
-                            if (lock and use_follow_auto_lock) or (diff.x <= follow_safezone_sensitivity and diff.y <= follow_safezone_sensitivity) then
-                                -- Make the new center the position of the current camera (which might not be the same as the mouse since we lerp towards it)
-                                locked_center = {
-                                    x = math.floor(crop_filter_info.x + zoom_target.crop.w * 0.5),
-                                    y = math.floor(crop_filter_info.y + zoom_target.crop.h * 0.5)
-                                }
-                                log("Cursor stopped. Tracking locked to " .. locked_center.x .. ", " .. locked_center.y)
-                            end
-                        end
+                    if (lock and use_follow_auto_lock) or (diff.x <= follow_safezone_sensitivity and diff.y <= follow_safezone_sensitivity) then
+                        -- Make the new center the position of the current camera (which might not be the same as the mouse since we lerp towards it)
+                        locked_center = {
+                            x = math.floor(crop_filter_info.x + zoom_target.crop.w * 0.5),
+                            y = math.floor(crop_filter_info.y + zoom_target.crop.h * 0.5)
+                        }
+                        log("Cursor stopped. Tracking locked to " .. locked_center.x .. ", " .. locked_center.y)
                     end
                 end
             end
         end
-
-        -- Check to see if the animation is over
-        if zoom_time >= 1 then
-            local should_stop_timer = false
-            -- When we finished zooming out we remove the timer
-            if zoom_state == ZoomState.ZoomingOut then
-                log("Zoomed out")
-                zoom_state = ZoomState.None
-                should_stop_timer = true
-            elseif zoom_state == ZoomState.ZoomingIn then
-                log("Zoomed in")
-                zoom_state = ZoomState.ZoomedIn
-                -- If we finished zooming in and we arent tracking the mouse we can also remove the timer
-                should_stop_timer = (not use_auto_follow_mouse) and (not is_following_mouse)
-
-                if use_auto_follow_mouse then
-                    is_following_mouse = true
-                    log("Tracking mouse is " .. (is_following_mouse and "on" or "off") .. " (due to auto follow)")
-                end
-
-                -- We set the current position as the center for the follow safezone
-                if is_following_mouse and follow_border < 50 then
-                    zoom_target = get_target_position(zoom_info)
-                    locked_center = { x = zoom_target.clamped_center.x, y = zoom_target.clamped_center.y }
-                    log("Cursor stopped. Tracking locked to " .. locked_center.x .. ", " .. locked_center.y)
-                end
-            end
-
-            if should_stop_timer then
-                is_timer_running = false
-                obs.timer_remove(on_timer)
-            end
-        end
+    else
+        stop_zoom_timer_if_idle()
     end
 end
 
@@ -1545,16 +2314,35 @@ function on_socket_timer()
     repeat
         local data, status = socket_server:receive_from()
         if data then
-            local sx, sy = data:match("(-?%d+) (-?%d+)")
-            if sx and sy then
-                local x = tonumber(sx, 10)
-                local y = tonumber(sy, 10)
-                if not socket_mouse then
+            local rx, ry, rw, rh = data:match("^%s*rect%s+(-?%d+)%s+(-?%d+)%s+(%d+)%s+(%d+)%s*$")
+            if rx and ry and rw and rh then
+                if socket_mouse == nil and socket_target == nil then
                     log("Socket server client connected")
-                    socket_mouse = { x = x, y = y }
-                else
-                    socket_mouse.x = x
-                    socket_mouse.y = y
+                end
+
+                socket_mouse = nil
+                socket_target = {
+                    kind = TargetKind.Rect,
+                    x = tonumber(rx, 10) or 0,
+                    y = tonumber(ry, 10) or 0,
+                    w = math.max(1, tonumber(rw, 10) or 1),
+                    h = math.max(1, tonumber(rh, 10) or 1),
+                    coordinate_space = "source",
+                }
+            else
+                local sx, sy = data:match("^%s*(-?%d+)%s+(-?%d+)%s*$")
+                if sx and sy then
+                    local x = tonumber(sx, 10)
+                    local y = tonumber(sy, 10)
+                    socket_target = nil
+
+                    if not socket_mouse then
+                        log("Socket server client connected")
+                        socket_mouse = { x = x, y = y }
+                    else
+                        socket_mouse.x = x
+                        socket_mouse.y = y
+                    end
                 end
             end
         elseif status ~= "timeout" then
@@ -1585,6 +2373,7 @@ function stop_server()
         socket_server:close()
         socket_server = nil
         socket_mouse = nil
+        socket_target = nil
     end
 end
 
@@ -1677,6 +2466,12 @@ function on_settings_modified(props, prop, settings)
         local sources_list = obs.obs_properties_get(props, "source")
         populate_zoom_sources(sources_list)
         return true
+    elseif name == "motion_preset" then
+        local selected = normalize_motion_preset(obs.obs_data_get_string(settings, "motion_preset"))
+        if selected ~= MotionPreset.Custom then
+            apply_motion_preset_to_settings(settings, selected)
+        end
+        return true
     elseif name == "debug_logs" then
         if obs.obs_data_get_bool(settings, "debug_logs") then
             log_current_settings()
@@ -1691,13 +2486,26 @@ end
 function log_current_settings()
     local settings = {
         zoom_value = zoom_value,
-        zoom_speed = zoom_speed,
+        motion_preset = motion_preset,
+        zoom_in_duration_ms = zoom_in_duration_ms,
+        zoom_out_duration_ms = zoom_out_duration_ms,
+        zoom_in_easing = zoom_in_easing,
+        zoom_out_easing = zoom_out_easing,
+        scale_filter_policy = scale_filter_policy,
+        overshoot_mode = overshoot_mode,
+        overshoot_percent = overshoot_percent,
+        overshoot_settle_ratio = overshoot_settle_ratio,
+        legacy_zoom_speed = legacy_zoom_speed,
         use_auto_follow_mouse = use_auto_follow_mouse,
         use_follow_outside_bounds = use_follow_outside_bounds,
         follow_speed = follow_speed,
         follow_border = follow_border,
         follow_safezone_sensitivity = follow_safezone_sensitivity,
         use_follow_auto_lock = use_follow_auto_lock,
+        use_cursor_stability_delay = use_cursor_stability_delay,
+        cursor_stability_duration_ms = cursor_stability_duration_ms,
+        cursor_stability_max_wait_ms = cursor_stability_max_wait_ms,
+        cursor_stability_threshold_px = cursor_stability_threshold_px,
         use_monitor_override = use_monitor_override,
         monitor_override_x = monitor_override_x,
         monitor_override_y = monitor_override_y,
@@ -1733,8 +2541,15 @@ function on_print_help()
         "----------------------------------------------------\n" ..
         "This script will zoom the selected display-capture source to focus on the mouse\n\n" ..
         "Zoom Source: The display capture in the current scene to use for zooming\n" ..
+        "Motion Preset: A starting point for natural zoom timing and easing\n" ..
         "Zoom Factor: How much to zoom in by\n" ..
-        "Zoom Speed: The speed of the zoom in/out animation\n" ..
+        "Zoom In Duration: How long zoom-in animation takes in milliseconds\n" ..
+        "Zoom Out Duration: How long zoom-out animation takes in milliseconds\n" ..
+        "Zoom In/Out Easing: The easing curve used by each zoom direction\n" ..
+        "Cursor settle before zoom: True to wait briefly for the cursor to stop before zooming in\n" ..
+        "Cursor Stable Duration: How long the cursor must stay within the movement threshold before zoom starts\n" ..
+        "Max Cursor Wait: The longest time to wait before zooming to the latest cursor position\n" ..
+        "Cursor Movement Threshold: Movement in pixels that still counts as stable during the wait\n" ..
         "Auto follow mouse: True to track the cursor while you are zoomed in\n" ..
         "Follow outside bounds: True to track the cursor even when it is outside the bounds of the source\n" ..
         "Follow Speed: The speed at which the zoomed area will follow the mouse when tracking\n" ..
@@ -1755,6 +2570,7 @@ function on_print_help()
     if socket_available then
         help = help ..
             "Enable remote mouse listener: True to start a UDP socket server that will listen for mouse position messages from a remote client, see: https://github.com/BlankSourceCode/obs-zoom-to-mouse-remote\n" ..
+            "Remote messages: send \"x y\" for a point target or \"rect x y width height\" for a source-coordinate rectangle target\n" ..
             "Port: The port number to use for the socket server\n" ..
             "Poll Delay: The time between updating the mouse position (in milliseconds)\n"
     end
@@ -1792,8 +2608,62 @@ function script_properties()
         "Click to re-populate Zoom Sources dropdown with available sources")
 
     -- Add the rest of the settings UI
-    local zoom = obs.obs_properties_add_float(props, "zoom_value", "Zoom Factor", 1, 5, 0.5)
-    local zoom_speed = obs.obs_properties_add_float_slider(props, "zoom_speed", "Zoom Speed", 0.01, 1, 0.01)
+    local preset = obs.obs_properties_add_list(props, "motion_preset", "Motion Preset", obs.OBS_COMBO_TYPE_LIST,
+        obs.OBS_COMBO_FORMAT_STRING)
+    add_motion_preset_options(preset)
+    obs.obs_property_set_long_description(preset,
+        "Choose a natural zoom timing preset, or Custom to tune each value manually")
+
+    local zoom = obs.obs_properties_add_float(props, "zoom_value", "Zoom Factor", 1, 5, 0.05)
+    local zoom_in_duration = obs.obs_properties_add_int_slider(props, "zoom_in_duration_ms", "Zoom In Duration (ms)",
+        50, 1200, 10)
+    local zoom_out_duration = obs.obs_properties_add_int_slider(props, "zoom_out_duration_ms", "Zoom Out Duration (ms)",
+        50, 1200, 10)
+    local zoom_in_easing_prop = obs.obs_properties_add_list(props, "zoom_in_easing", "Zoom In Easing",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    local zoom_out_easing_prop = obs.obs_properties_add_list(props, "zoom_out_easing", "Zoom Out Easing",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    add_easing_options(zoom_in_easing_prop)
+    add_easing_options(zoom_out_easing_prop)
+    obs.obs_property_set_long_description(zoom_in_duration,
+        "Duration of the zoom-in camera animation in milliseconds")
+    obs.obs_property_set_long_description(zoom_out_duration,
+        "Duration of the zoom-out camera animation in milliseconds")
+
+    local overshoot_prop = obs.obs_properties_add_list(props, "overshoot_mode", "Zoom Overshoot",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    local overshoot_amount = obs.obs_properties_add_float_slider(props, "overshoot_percent",
+        "Overshoot Amount (%)", 0, 2, 0.1)
+    add_overshoot_options(overshoot_prop)
+    obs.obs_property_set_long_description(overshoot_prop,
+        "Optional subtle zoom-in settle effect. Keep off for professional tutorial presets.")
+    obs.obs_property_set_long_description(overshoot_amount,
+        "Maximum temporary zoom-in overshoot. Keep within 1-2%.")
+
+    local scale_filter_prop = obs.obs_properties_add_list(props, "scale_filter_policy", "Scale Filter Policy",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    add_scale_filter_policy_options(scale_filter_prop)
+    obs.obs_property_set_long_description(scale_filter_prop,
+        "Optional scene item scale-filter helper. Leave unchanged preserves the current OBS scene item setting.")
+
+    local cursor_props = obs.obs_properties_create()
+    local cursor_stable_duration = obs.obs_properties_add_int_slider(cursor_props,
+        "cursor_stability_duration_ms", "Cursor Stable Duration (ms)", 0, 500, 10)
+    local cursor_max_wait = obs.obs_properties_add_int_slider(cursor_props,
+        "cursor_stability_max_wait_ms", "Max Cursor Wait (ms)", 0, 1000, 10)
+    local cursor_threshold = obs.obs_properties_add_int_slider(cursor_props,
+        "cursor_stability_threshold_px", "Cursor Movement Threshold (px)", 0, 50, 1)
+    local cursor_stability = obs.obs_properties_add_group(props,
+        "cursor_stability_delay", "Cursor settle before zoom ", obs.OBS_GROUP_CHECKABLE, cursor_props)
+    obs.obs_property_set_long_description(cursor_stability,
+        "When enabled, zoom-in waits briefly for the cursor to settle or until the max wait is reached")
+    obs.obs_property_set_long_description(cursor_stable_duration,
+        "How long the cursor must stay within the movement threshold before zoom starts")
+    obs.obs_property_set_long_description(cursor_max_wait,
+        "The longest time to wait before zooming to the latest cursor position")
+    obs.obs_property_set_long_description(cursor_threshold,
+        "Maximum cursor movement that still counts as stable during the wait")
+
     local follow = obs.obs_properties_add_bool(props, "follow", "Auto follow mouse ")
     obs.obs_property_set_long_description(follow,
         "When enabled mouse traking will auto-start when zoomed in without waiting for tracking toggle hotkey")
@@ -1887,6 +2757,7 @@ function script_properties()
     obs.obs_property_set_visible(override_dh, use_monitor_override)
     obs.obs_property_set_modified_callback(override, on_settings_modified)
 
+    obs.obs_property_set_modified_callback(preset, on_settings_modified)
     obs.obs_property_set_modified_callback(allow_all, on_settings_modified)
     obs.obs_property_set_modified_callback(debug, on_settings_modified)
 
@@ -1895,6 +2766,7 @@ end
 
 function script_load(settings)
     sceneitem_info_orig = nil
+    migrate_legacy_motion_preset(settings)
 
     -- Workaround for detecting if OBS is already loaded and we were reloaded using "Reload Scripts"
     local current_scene = obs.obs_frontend_get_current_scene()
@@ -1919,13 +2791,27 @@ function script_load(settings)
 
     -- Load any other settings
     zoom_value = obs.obs_data_get_double(settings, "zoom_value")
-    zoom_speed = obs.obs_data_get_double(settings, "zoom_speed")
+    legacy_zoom_speed = obs.obs_data_get_double(settings, "zoom_speed")
+    motion_preset = normalize_motion_preset(obs.obs_data_get_string(settings, "motion_preset"))
+    zoom_in_duration_ms = obs.obs_data_get_int(settings, "zoom_in_duration_ms")
+    zoom_out_duration_ms = obs.obs_data_get_int(settings, "zoom_out_duration_ms")
+    zoom_in_easing = normalize_easing(obs.obs_data_get_string(settings, "zoom_in_easing"), Easing.EaseOutCubic)
+    zoom_out_easing = normalize_easing(obs.obs_data_get_string(settings, "zoom_out_easing"), Easing.EaseInOutCubic)
+    scale_filter_policy = normalize_scale_filter_policy(obs.obs_data_get_string(settings, "scale_filter_policy"))
+    overshoot_mode = normalize_overshoot_mode(obs.obs_data_get_string(settings, "overshoot_mode"))
+    overshoot_percent = obs.obs_data_get_double(settings, "overshoot_percent")
+    normalize_overshoot_settings()
     use_auto_follow_mouse = obs.obs_data_get_bool(settings, "follow")
     use_follow_outside_bounds = obs.obs_data_get_bool(settings, "follow_outside_bounds")
     follow_speed = obs.obs_data_get_double(settings, "follow_speed")
     follow_border = obs.obs_data_get_int(settings, "follow_border")
     follow_safezone_sensitivity = obs.obs_data_get_int(settings, "follow_safezone_sensitivity")
     use_follow_auto_lock = obs.obs_data_get_bool(settings, "follow_auto_lock")
+    use_cursor_stability_delay = obs.obs_data_get_bool(settings, "cursor_stability_delay")
+    cursor_stability_duration_ms = obs.obs_data_get_int(settings, "cursor_stability_duration_ms")
+    cursor_stability_max_wait_ms = obs.obs_data_get_int(settings, "cursor_stability_max_wait_ms")
+    cursor_stability_threshold_px = obs.obs_data_get_int(settings, "cursor_stability_threshold_px")
+    normalize_cursor_stability_settings()
     allow_all_sources = obs.obs_data_get_bool(settings, "allow_all_sources")
     use_monitor_override = obs.obs_data_get_bool(settings, "use_monitor_override")
     monitor_override_x = obs.obs_data_get_int(settings, "monitor_override_x")
@@ -1975,6 +2861,7 @@ end
 
 function script_unload()
     is_script_loaded = false
+    reset_cursor_zoom_pending()
 
     -- Clean up the memory usage
     if obs_version_at_least(29, 1, 3) then -- 29.1.2 and below seems to crash if you do this, so we ignore it as the script is closing anyway
@@ -2006,14 +2893,26 @@ end
 
 function script_defaults(settings)
     -- Default values for the script
-    obs.obs_data_set_default_double(settings, "zoom_value", 2)
+    obs.obs_data_set_default_string(settings, "motion_preset", MotionPreset.Tutorial)
+    obs.obs_data_set_default_double(settings, "zoom_value", 1.45)
     obs.obs_data_set_default_double(settings, "zoom_speed", 0.06)
+    obs.obs_data_set_default_int(settings, "zoom_in_duration_ms", 420)
+    obs.obs_data_set_default_int(settings, "zoom_out_duration_ms", 320)
+    obs.obs_data_set_default_string(settings, "zoom_in_easing", Easing.EaseOutCubic)
+    obs.obs_data_set_default_string(settings, "zoom_out_easing", Easing.EaseInOutCubic)
+    obs.obs_data_set_default_string(settings, "scale_filter_policy", ScaleFilterPolicy.LeaveUnchanged)
+    obs.obs_data_set_default_string(settings, "overshoot_mode", OvershootMode.Off)
+    obs.obs_data_set_default_double(settings, "overshoot_percent", 1.0)
     obs.obs_data_set_default_bool(settings, "follow", true)
     obs.obs_data_set_default_bool(settings, "follow_outside_bounds", false)
     obs.obs_data_set_default_double(settings, "follow_speed", 0.25)
     obs.obs_data_set_default_int(settings, "follow_border", 8)
     obs.obs_data_set_default_int(settings, "follow_safezone_sensitivity", 4)
     obs.obs_data_set_default_bool(settings, "follow_auto_lock", false)
+    obs.obs_data_set_default_bool(settings, "cursor_stability_delay", true)
+    obs.obs_data_set_default_int(settings, "cursor_stability_duration_ms", 150)
+    obs.obs_data_set_default_int(settings, "cursor_stability_max_wait_ms", 250)
+    obs.obs_data_set_default_int(settings, "cursor_stability_threshold_px", 4)
     obs.obs_data_set_default_bool(settings, "allow_all_sources", false)
     obs.obs_data_set_default_bool(settings, "use_monitor_override", false)
     obs.obs_data_set_default_int(settings, "monitor_override_x", 0)
@@ -2047,6 +2946,8 @@ function script_save(settings)
 end
 
 function script_update(settings)
+    migrate_legacy_motion_preset(settings)
+
     local old_source_name = source_name
     local old_override = use_monitor_override
     local old_x = monitor_override_x
@@ -2061,17 +2962,32 @@ function script_update(settings)
     local old_port = socket_port
     local old_poll = socket_poll
     local old_retina_mode = retina_mode
+    local old_scale_filter_policy = scale_filter_policy
 
     -- Update the settings
     source_name = obs.obs_data_get_string(settings, "source")
     zoom_value = obs.obs_data_get_double(settings, "zoom_value")
-    zoom_speed = obs.obs_data_get_double(settings, "zoom_speed")
+    legacy_zoom_speed = obs.obs_data_get_double(settings, "zoom_speed")
+    motion_preset = normalize_motion_preset(obs.obs_data_get_string(settings, "motion_preset"))
+    zoom_in_duration_ms = obs.obs_data_get_int(settings, "zoom_in_duration_ms")
+    zoom_out_duration_ms = obs.obs_data_get_int(settings, "zoom_out_duration_ms")
+    zoom_in_easing = normalize_easing(obs.obs_data_get_string(settings, "zoom_in_easing"), Easing.EaseOutCubic)
+    zoom_out_easing = normalize_easing(obs.obs_data_get_string(settings, "zoom_out_easing"), Easing.EaseInOutCubic)
+    scale_filter_policy = normalize_scale_filter_policy(obs.obs_data_get_string(settings, "scale_filter_policy"))
+    overshoot_mode = normalize_overshoot_mode(obs.obs_data_get_string(settings, "overshoot_mode"))
+    overshoot_percent = obs.obs_data_get_double(settings, "overshoot_percent")
+    normalize_overshoot_settings()
     use_auto_follow_mouse = obs.obs_data_get_bool(settings, "follow")
     use_follow_outside_bounds = obs.obs_data_get_bool(settings, "follow_outside_bounds")
     follow_speed = obs.obs_data_get_double(settings, "follow_speed")
     follow_border = obs.obs_data_get_int(settings, "follow_border")
     follow_safezone_sensitivity = obs.obs_data_get_int(settings, "follow_safezone_sensitivity")
     use_follow_auto_lock = obs.obs_data_get_bool(settings, "follow_auto_lock")
+    use_cursor_stability_delay = obs.obs_data_get_bool(settings, "cursor_stability_delay")
+    cursor_stability_duration_ms = obs.obs_data_get_int(settings, "cursor_stability_duration_ms")
+    cursor_stability_max_wait_ms = obs.obs_data_get_int(settings, "cursor_stability_max_wait_ms")
+    cursor_stability_threshold_px = obs.obs_data_get_int(settings, "cursor_stability_threshold_px")
+    normalize_cursor_stability_settings()
     allow_all_sources = obs.obs_data_get_bool(settings, "allow_all_sources")
     use_monitor_override = obs.obs_data_get_bool(settings, "use_monitor_override")
     monitor_override_x = obs.obs_data_get_int(settings, "monitor_override_x")
@@ -2125,6 +3041,10 @@ function script_update(settings)
     elseif use_socket and (old_poll ~= socket_poll or old_port ~= socket_port) then
         stop_server()
         start_server()
+    end
+
+    if old_scale_filter_policy ~= scale_filter_policy and sceneitem ~= nil then
+        apply_scale_filter_policy()
     end
 end
 

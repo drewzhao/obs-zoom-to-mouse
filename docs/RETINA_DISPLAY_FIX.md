@@ -194,51 +194,11 @@ The zoom center should match the cursor position regardless of where on the scre
 | v1.1.1 | Buggy | Attempted fix with incorrect display_height calculation |
 | v1.2.0 | **Fixed** | Direct backing scale detection + correct coordinate handling |
 
-### Python Version
+### Removed Python Version
 
 | Version | Status | Notes |
 |---------|--------|-------|
-| v2.0.0 | Partial | Retina works (pynput handles Y-flip), but multi-monitor Y coords wrong |
-| v2.1.0 | **Fixed** | Fixed multi-monitor Y coordinate system + direct backing scale detection |
-
----
-
-## Python Version Fixes (v2.1.0)
-
-The Python version had a different issue related to macOS coordinate systems:
-
-### The Problem
-
-On macOS, different APIs use different coordinate origins:
-
-| API | Y Origin | Y Direction |
-|-----|----------|-------------|
-| `NSScreen.frame.origin` | Bottom of primary display | Upward |
-| `pynput` / `CGEvent` | Top of primary display | Downward |
-
-The `DisplayManager` was storing display Y positions from `NSScreen.frame.origin.y` without converting to the coordinate system used by `pynput`. This caused incorrect display offset calculations in multi-monitor setups.
-
-### The Fix
-
-In `display_manager.py`, the Y coordinate is now converted from macOS bottom-left origin to standard top-left origin:
-
-```python
-# Convert Y coordinate from macOS bottom-left origin to top-left origin
-# In macOS: Y=0 is at bottom of primary display, Y increases upward
-# In pynput/standard: Y=0 is at top of primary display, Y increases downward
-standard_y = int(primary_height - (macos_y + screen_height))
-```
-
-Additionally, direct backing scale detection was added as the primary method:
-
-```python
-# Method 1: Direct backing scale detection on macOS
-if sys.platform == 'darwin':
-    backing_scale = get_macos_backing_scale_factor()
-    if backing_scale > 1.0:
-        scale_x = backing_scale
-        scale_y = backing_scale
-```
+| v2.0.0-v2.1.0 | Removed | The Python implementation used the same Crop/Pad rendering path as Lua while adding Python runtime and dependency setup. The project now keeps Lua as the single maintained implementation. |
 
 ---
 
@@ -246,4 +206,3 @@ if sys.platform == 'darwin':
 
 - Original bug report and testing: User community
 - Lua fix implementation: v1.2.0
-- Python fix implementation: v2.1.0
