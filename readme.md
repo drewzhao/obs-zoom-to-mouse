@@ -145,6 +145,6 @@ More detail lives in the [user guide](docs/USER_GUIDE.md) and [architecture guid
 
 ## Support
 
-Want to support the original project author?
+Want to support the project author? I'd appreciate a coffee if this helps you!
 
-<a href="https://www.buymeacoffee.com/blanksourcecode" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
+[![Support this project via PayPal](https://img.shields.io/badge/Support%20this%20project-PayPal-FFD140?style=for-the-badge&logo=paypal&logoColor=003087)](https://www.paypal.com/ncp/payment/5H5YBE44XHSEG)
