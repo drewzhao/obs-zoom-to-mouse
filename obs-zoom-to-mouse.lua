@@ -115,6 +115,18 @@ local TargetKind = {
     Rect = "rect",
 }
 
+local ScaleFilterPolicy = {
+    LeaveUnchanged = "leave_unchanged",
+    RecommendInLog = "recommend_in_log",
+    TemporarilySetLanczos = "temporarily_set_lanczos",
+    TemporarilySetBicubic = "temporarily_set_bicubic",
+}
+
+local OvershootMode = {
+    Off = "off",
+    Subtle = "subtle",
+}
+
 local motion_preset = MotionPreset.Tutorial
 local zoom_in_duration_ms = 420
 local zoom_out_duration_ms = 320
@@ -123,6 +135,16 @@ local zoom_out_easing = Easing.EaseInOutCubic
 local target_screen_x = 0.50
 local target_screen_y = 0.45
 local target_rect_margin = 1.18
+local scale_filter_policy = ScaleFilterPolicy.LeaveUnchanged
+local scale_filter_restore = {
+    active = false,
+    item = nil,
+    original_filter = nil,
+    target_filter = nil,
+}
+local overshoot_mode = OvershootMode.Off
+local overshoot_percent = 1.0
+local overshoot_settle_ratio = 0.18
 
 local MotionPresetSettings = {
     [MotionPreset.Tutorial] = {
@@ -131,6 +153,8 @@ local MotionPresetSettings = {
         zoom_out_duration_ms = 320,
         zoom_in_easing = Easing.EaseOutCubic,
         zoom_out_easing = Easing.EaseInOutCubic,
+        overshoot_mode = OvershootMode.Off,
+        overshoot_percent = 1.0,
     },
     [MotionPreset.QuickFocus] = {
         zoom_value = 1.35,
@@ -138,6 +162,8 @@ local MotionPresetSettings = {
         zoom_out_duration_ms = 240,
         zoom_in_easing = Easing.EaseOutCubic,
         zoom_out_easing = Easing.EaseOutCubic,
+        overshoot_mode = OvershootMode.Off,
+        overshoot_percent = 1.0,
     },
     [MotionPreset.DetailedInspection] = {
         zoom_value = 1.75,
@@ -145,6 +171,8 @@ local MotionPresetSettings = {
         zoom_out_duration_ms = 360,
         zoom_in_easing = Easing.EaseInOutCubic,
         zoom_out_easing = Easing.EaseInOutCubic,
+        overshoot_mode = OvershootMode.Off,
+        overshoot_percent = 1.0,
     },
     [MotionPreset.EnergeticDemo] = {
         zoom_value = 1.60,
@@ -152,6 +180,8 @@ local MotionPresetSettings = {
         zoom_out_duration_ms = 260,
         zoom_in_easing = Easing.EaseOutQuart,
         zoom_out_easing = Easing.EaseOutCubic,
+        overshoot_mode = OvershootMode.Subtle,
+        overshoot_percent = 1.0,
     },
     [MotionPreset.ReducedMotion] = {
         zoom_value = 1.15,
@@ -159,6 +189,8 @@ local MotionPresetSettings = {
         zoom_out_duration_ms = 100,
         zoom_in_easing = Easing.EaseOutCubic,
         zoom_out_easing = Easing.EaseOutCubic,
+        overshoot_mode = OvershootMode.Off,
+        overshoot_percent = 1.0,
     },
 }
 
@@ -188,6 +220,10 @@ local camera_animation = {
     elapsed_ms = 0,
     duration_ms = 420,
     easing = Easing.EaseOutCubic,
+    settle_to = nil,
+    settle_duration_ms = 0,
+    settle_easing = Easing.EaseOutCubic,
+    lock_target = false,
 }
 
 local cursor_zoom_pending = {
@@ -749,6 +785,25 @@ local function normalize_motion_preset(value)
     return MotionPreset.Tutorial
 end
 
+local function normalize_scale_filter_policy(value)
+    if value == ScaleFilterPolicy.LeaveUnchanged or
+        value == ScaleFilterPolicy.RecommendInLog or
+        value == ScaleFilterPolicy.TemporarilySetLanczos or
+        value == ScaleFilterPolicy.TemporarilySetBicubic then
+        return value
+    end
+
+    return ScaleFilterPolicy.LeaveUnchanged
+end
+
+local function normalize_overshoot_mode(value)
+    if value == OvershootMode.Off or value == OvershootMode.Subtle then
+        return value
+    end
+
+    return OvershootMode.Off
+end
+
 local function copy_crop(crop)
     return {
         x = crop.x or 0,
@@ -773,6 +828,12 @@ local function normalize_cursor_stability_settings()
     cursor_stability_threshold_px = math.max(0, cursor_stability_threshold_px or 0)
 end
 
+local function normalize_overshoot_settings()
+    overshoot_mode = normalize_overshoot_mode(overshoot_mode)
+    overshoot_percent = clamp(0, 2, overshoot_percent or 0)
+    overshoot_settle_ratio = clamp(0.05, 0.40, overshoot_settle_ratio or 0.18)
+end
+
 local function add_easing_options(prop)
     obs.obs_property_list_add_string(prop, "Linear", Easing.Linear)
     obs.obs_property_list_add_string(prop, "Ease out cubic", Easing.EaseOutCubic)
@@ -790,6 +851,18 @@ local function add_motion_preset_options(prop)
     obs.obs_property_list_add_string(prop, "Custom", MotionPreset.Custom)
 end
 
+local function add_scale_filter_policy_options(prop)
+    obs.obs_property_list_add_string(prop, "Leave unchanged", ScaleFilterPolicy.LeaveUnchanged)
+    obs.obs_property_list_add_string(prop, "Recommend in log", ScaleFilterPolicy.RecommendInLog)
+    obs.obs_property_list_add_string(prop, "Temporarily set Lanczos", ScaleFilterPolicy.TemporarilySetLanczos)
+    obs.obs_property_list_add_string(prop, "Temporarily set Bicubic", ScaleFilterPolicy.TemporarilySetBicubic)
+end
+
+local function add_overshoot_options(prop)
+    obs.obs_property_list_add_string(prop, "Off", OvershootMode.Off)
+    obs.obs_property_list_add_string(prop, "Subtle", OvershootMode.Subtle)
+end
+
 local function apply_motion_preset_to_settings(settings, preset)
     local preset_settings = MotionPresetSettings[preset]
     if preset_settings == nil then
@@ -801,6 +874,8 @@ local function apply_motion_preset_to_settings(settings, preset)
     obs.obs_data_set_int(settings, "zoom_out_duration_ms", preset_settings.zoom_out_duration_ms)
     obs.obs_data_set_string(settings, "zoom_in_easing", preset_settings.zoom_in_easing)
     obs.obs_data_set_string(settings, "zoom_out_easing", preset_settings.zoom_out_easing)
+    obs.obs_data_set_string(settings, "overshoot_mode", preset_settings.overshoot_mode)
+    obs.obs_data_set_double(settings, "overshoot_percent", preset_settings.overshoot_percent)
 end
 
 local function settings_has_user_value(settings, name)
@@ -820,6 +895,117 @@ local function migrate_legacy_motion_preset(settings)
         settings_has_user_value(settings, "zoom_speed") then
         obs.obs_data_set_string(settings, "motion_preset", MotionPreset.Custom)
     end
+end
+
+function scale_filter_api_available()
+    return type(obs.obs_sceneitem_get_scale_filter) == "function" and
+        type(obs.obs_sceneitem_set_scale_filter) == "function" and
+        type(obs.OBS_SCALE_LANCZOS) == "number" and
+        type(obs.OBS_SCALE_BICUBIC) == "number"
+end
+
+function scale_filter_policy_to_filter(policy)
+    policy = normalize_scale_filter_policy(policy)
+
+    if policy == ScaleFilterPolicy.TemporarilySetLanczos then
+        return obs.OBS_SCALE_LANCZOS
+    elseif policy == ScaleFilterPolicy.TemporarilySetBicubic then
+        return obs.OBS_SCALE_BICUBIC
+    end
+
+    return nil
+end
+
+function apply_scale_filter_policy_to_item(item, policy)
+    policy = normalize_scale_filter_policy(policy)
+
+    local result = {
+        policy = policy,
+        applied = false,
+        original_filter = nil,
+        target_filter = nil,
+    }
+
+    if item == nil or policy == ScaleFilterPolicy.LeaveUnchanged then
+        return result
+    end
+
+    if policy == ScaleFilterPolicy.RecommendInLog then
+        obs.script_log(obs.OBS_LOG_INFO,
+            "Scale filter recommendation: try Lanczos for sharper zoomed text, or Bicubic if Lanczos looks too sharp.")
+        return result
+    end
+
+    if not scale_filter_api_available() then
+        log("Scale filter policy skipped because this OBS Lua runtime does not expose scene item scale filter APIs.")
+        return result
+    end
+
+    local target_filter = scale_filter_policy_to_filter(policy)
+    if target_filter == nil then
+        return result
+    end
+
+    local original_filter = obs.obs_sceneitem_get_scale_filter(item)
+    result.original_filter = original_filter
+    result.target_filter = target_filter
+
+    if original_filter ~= target_filter then
+        obs.obs_sceneitem_set_scale_filter(item, target_filter)
+        result.applied = true
+        log("Temporarily applied zoom scale filter policy: " .. policy)
+    end
+
+    return result
+end
+
+function restore_scale_filter_policy_for_item(item, state)
+    if item == nil or state == nil or (state.applied ~= true and state.active ~= true) then
+        return false
+    end
+
+    if state.original_filter == nil then
+        return false
+    end
+
+    if not scale_filter_api_available() then
+        return false
+    end
+
+    obs.obs_sceneitem_set_scale_filter(item, state.original_filter)
+    return true
+end
+
+function restore_scale_filter_policy()
+    if scale_filter_restore.active ~= true then
+        return false
+    end
+
+    local restored = restore_scale_filter_policy_for_item(scale_filter_restore.item, scale_filter_restore)
+    if restored then
+        log("Restored original scene item scale filter")
+    end
+
+    scale_filter_restore.active = false
+    scale_filter_restore.item = nil
+    scale_filter_restore.original_filter = nil
+    scale_filter_restore.target_filter = nil
+
+    return restored
+end
+
+function apply_scale_filter_policy()
+    restore_scale_filter_policy()
+
+    local applied = apply_scale_filter_policy_to_item(sceneitem, scale_filter_policy)
+    if applied.applied then
+        scale_filter_restore.active = true
+        scale_filter_restore.item = sceneitem
+        scale_filter_restore.original_filter = applied.original_filter
+        scale_filter_restore.target_filter = applied.target_filter
+    end
+
+    return applied
 end
 
 function start_zoom_timer()
@@ -849,7 +1035,9 @@ function stop_zoom_timer_if_idle()
     end
 end
 
-function start_crop_animation(state, from_crop, to_crop, duration_ms, easing)
+function start_crop_animation(state, from_crop, to_crop, duration_ms, easing, options)
+    options = options or {}
+
     camera_animation.active = true
     camera_animation.state = state
     camera_animation.from = copy_crop(from_crop)
@@ -857,6 +1045,10 @@ function start_crop_animation(state, from_crop, to_crop, duration_ms, easing)
     camera_animation.elapsed_ms = 0
     camera_animation.duration_ms = math.max(1, duration_ms or 1)
     camera_animation.easing = normalize_easing(easing, Easing.EaseOutCubic)
+    camera_animation.settle_to = options.settle_to and copy_crop(options.settle_to) or nil
+    camera_animation.settle_duration_ms = math.max(1, options.settle_duration_ms or 1)
+    camera_animation.settle_easing = normalize_easing(options.settle_easing, Easing.EaseOutCubic)
+    camera_animation.lock_target = options.lock_target == true
     zoom_state = state
     start_zoom_timer()
 end
@@ -866,7 +1058,7 @@ function update_crop_animation(elapsed_ms)
         return false
     end
 
-    if camera_animation.state == ZoomState.ZoomingIn and use_auto_follow_mouse then
+    if camera_animation.state == ZoomState.ZoomingIn and use_auto_follow_mouse and not camera_animation.lock_target then
         zoom_target = get_target_position(zoom_info)
         camera_animation.to = copy_crop(zoom_target.crop)
     end
@@ -888,8 +1080,21 @@ function update_crop_animation(elapsed_ms)
         crop_filter_info.h = camera_animation.to.h
         set_crop_settings(crop_filter_info)
 
+        if camera_animation.state == ZoomState.ZoomingIn and camera_animation.settle_to ~= nil then
+            local settle_to = copy_crop(camera_animation.settle_to)
+            camera_animation.from = copy_crop(camera_animation.to)
+            camera_animation.to = settle_to
+            camera_animation.elapsed_ms = 0
+            camera_animation.duration_ms = camera_animation.settle_duration_ms
+            camera_animation.easing = camera_animation.settle_easing
+            camera_animation.settle_to = nil
+            camera_animation.lock_target = true
+            return true
+        end
+
         local completed_state = camera_animation.state
         camera_animation.active = false
+        camera_animation.lock_target = false
 
         if completed_state == ZoomState.ZoomingOut then
             log("Zoomed out")
@@ -940,6 +1145,19 @@ function start_zoom_in_animation(target)
     locked_center = nil
     locked_last_pos = nil
     zoom_target = target or get_target_position(zoom_info)
+
+    local overshoot_options = create_overshoot_animation_options(zoom_info, zoom_target.crop, zoom_in_duration_ms)
+    if overshoot_options ~= nil then
+        start_crop_animation(ZoomState.ZoomingIn, crop_filter_info, overshoot_options.approach_to,
+            overshoot_options.approach_duration_ms, overshoot_options.approach_easing, {
+                settle_to = copy_crop(overshoot_options.settle_to),
+                settle_duration_ms = overshoot_options.settle_duration_ms,
+                settle_easing = overshoot_options.settle_easing,
+                lock_target = true,
+            })
+        return
+    end
+
     start_crop_animation(ZoomState.ZoomingIn, crop_filter_info, zoom_target.crop, zoom_in_duration_ms, zoom_in_easing)
 end
 
@@ -1408,6 +1626,8 @@ function release_sceneitem()
     reset_cursor_zoom_pending()
 
     if sceneitem ~= nil then
+        restore_scale_filter_policy()
+
         if crop_filter ~= nil and source ~= nil then
             log("Zoom crop filter removed")
             obs.obs_source_filter_remove(source, crop_filter)
@@ -1700,6 +1920,7 @@ function refresh_sceneitem(find_newest)
 
         obs.obs_source_filter_set_order(source, crop_filter, obs.OBS_ORDER_MOVE_BOTTOM)
         set_crop_settings(crop_filter_info_orig)
+        apply_scale_filter_policy()
     end
 end
 
@@ -1877,6 +2098,71 @@ end
 
 function get_target_position(zoom)
     return get_target_position_for_target(zoom, socket_target)
+end
+
+function build_overshoot_crop(zoom, final_crop, percent)
+    percent = clamp(0, 2, percent or overshoot_percent or 0)
+    if percent <= 0 then
+        return nil
+    end
+
+    local overshoot_scale = 1.0 + percent / 100.0
+    local anchor = {
+        x = final_crop.x + final_crop.w * target_screen_x,
+        y = final_crop.y + final_crop.h * target_screen_y,
+    }
+
+    local crop = {
+        w = final_crop.w / overshoot_scale,
+        h = final_crop.h / overshoot_scale,
+    }
+    crop.x = anchor.x - crop.w * target_screen_x
+    crop.y = anchor.y - crop.h * target_screen_y
+
+    crop = clamp_crop_to_source_bounds(zoom, crop)
+
+    local clamped_anchor = {
+        x = crop.x + crop.w * target_screen_x,
+        y = crop.y + crop.h * target_screen_y,
+    }
+
+    if math.abs(clamped_anchor.x - anchor.x) > 1 or math.abs(clamped_anchor.y - anchor.y) > 1 then
+        return nil
+    end
+
+    return crop
+end
+
+function create_overshoot_animation_options(zoom, final_crop, duration_ms, mode, percent, settle_ratio)
+    mode = normalize_overshoot_mode(mode or overshoot_mode)
+    percent = clamp(0, 2, percent or overshoot_percent or 0)
+    settle_ratio = clamp(0.05, 0.40, settle_ratio or overshoot_settle_ratio or 0.18)
+    duration_ms = math.max(1, duration_ms or 1)
+
+    if mode ~= OvershootMode.Subtle or percent <= 0 then
+        return nil
+    end
+
+    local overshoot_crop = build_overshoot_crop(zoom, final_crop, percent)
+    if overshoot_crop == nil then
+        return nil
+    end
+
+    local settle_duration_ms = math.max(1, math.floor(duration_ms * settle_ratio + 0.5))
+    local approach_duration_ms = math.max(1, duration_ms - settle_duration_ms)
+    if approach_duration_ms < 1 or settle_duration_ms < 1 then
+        return nil
+    end
+
+    return {
+        approach_to = copy_crop(overshoot_crop),
+        approach_duration_ms = approach_duration_ms,
+        approach_easing = Easing.EaseOutQuart,
+        settle_to = copy_crop(final_crop),
+        settle_duration_ms = settle_duration_ms,
+        settle_easing = Easing.EaseOutCubic,
+        lock_target = true,
+    }
 end
 
 function on_toggle_follow(pressed)
@@ -2205,6 +2491,10 @@ function log_current_settings()
         zoom_out_duration_ms = zoom_out_duration_ms,
         zoom_in_easing = zoom_in_easing,
         zoom_out_easing = zoom_out_easing,
+        scale_filter_policy = scale_filter_policy,
+        overshoot_mode = overshoot_mode,
+        overshoot_percent = overshoot_percent,
+        overshoot_settle_ratio = overshoot_settle_ratio,
         legacy_zoom_speed = legacy_zoom_speed,
         use_auto_follow_mouse = use_auto_follow_mouse,
         use_follow_outside_bounds = use_follow_outside_bounds,
@@ -2339,6 +2629,22 @@ function script_properties()
         "Duration of the zoom-in camera animation in milliseconds")
     obs.obs_property_set_long_description(zoom_out_duration,
         "Duration of the zoom-out camera animation in milliseconds")
+
+    local overshoot_prop = obs.obs_properties_add_list(props, "overshoot_mode", "Zoom Overshoot",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    local overshoot_amount = obs.obs_properties_add_float_slider(props, "overshoot_percent",
+        "Overshoot Amount (%)", 0, 2, 0.1)
+    add_overshoot_options(overshoot_prop)
+    obs.obs_property_set_long_description(overshoot_prop,
+        "Optional subtle zoom-in settle effect. Keep off for professional tutorial presets.")
+    obs.obs_property_set_long_description(overshoot_amount,
+        "Maximum temporary zoom-in overshoot. Keep within 1-2%.")
+
+    local scale_filter_prop = obs.obs_properties_add_list(props, "scale_filter_policy", "Scale Filter Policy",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    add_scale_filter_policy_options(scale_filter_prop)
+    obs.obs_property_set_long_description(scale_filter_prop,
+        "Optional scene item scale-filter helper. Leave unchanged preserves the current OBS scene item setting.")
 
     local cursor_props = obs.obs_properties_create()
     local cursor_stable_duration = obs.obs_properties_add_int_slider(cursor_props,
@@ -2491,6 +2797,10 @@ function script_load(settings)
     zoom_out_duration_ms = obs.obs_data_get_int(settings, "zoom_out_duration_ms")
     zoom_in_easing = normalize_easing(obs.obs_data_get_string(settings, "zoom_in_easing"), Easing.EaseOutCubic)
     zoom_out_easing = normalize_easing(obs.obs_data_get_string(settings, "zoom_out_easing"), Easing.EaseInOutCubic)
+    scale_filter_policy = normalize_scale_filter_policy(obs.obs_data_get_string(settings, "scale_filter_policy"))
+    overshoot_mode = normalize_overshoot_mode(obs.obs_data_get_string(settings, "overshoot_mode"))
+    overshoot_percent = obs.obs_data_get_double(settings, "overshoot_percent")
+    normalize_overshoot_settings()
     use_auto_follow_mouse = obs.obs_data_get_bool(settings, "follow")
     use_follow_outside_bounds = obs.obs_data_get_bool(settings, "follow_outside_bounds")
     follow_speed = obs.obs_data_get_double(settings, "follow_speed")
@@ -2590,6 +2900,9 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "zoom_out_duration_ms", 320)
     obs.obs_data_set_default_string(settings, "zoom_in_easing", Easing.EaseOutCubic)
     obs.obs_data_set_default_string(settings, "zoom_out_easing", Easing.EaseInOutCubic)
+    obs.obs_data_set_default_string(settings, "scale_filter_policy", ScaleFilterPolicy.LeaveUnchanged)
+    obs.obs_data_set_default_string(settings, "overshoot_mode", OvershootMode.Off)
+    obs.obs_data_set_default_double(settings, "overshoot_percent", 1.0)
     obs.obs_data_set_default_bool(settings, "follow", true)
     obs.obs_data_set_default_bool(settings, "follow_outside_bounds", false)
     obs.obs_data_set_default_double(settings, "follow_speed", 0.25)
@@ -2649,6 +2962,7 @@ function script_update(settings)
     local old_port = socket_port
     local old_poll = socket_poll
     local old_retina_mode = retina_mode
+    local old_scale_filter_policy = scale_filter_policy
 
     -- Update the settings
     source_name = obs.obs_data_get_string(settings, "source")
@@ -2659,6 +2973,10 @@ function script_update(settings)
     zoom_out_duration_ms = obs.obs_data_get_int(settings, "zoom_out_duration_ms")
     zoom_in_easing = normalize_easing(obs.obs_data_get_string(settings, "zoom_in_easing"), Easing.EaseOutCubic)
     zoom_out_easing = normalize_easing(obs.obs_data_get_string(settings, "zoom_out_easing"), Easing.EaseInOutCubic)
+    scale_filter_policy = normalize_scale_filter_policy(obs.obs_data_get_string(settings, "scale_filter_policy"))
+    overshoot_mode = normalize_overshoot_mode(obs.obs_data_get_string(settings, "overshoot_mode"))
+    overshoot_percent = obs.obs_data_get_double(settings, "overshoot_percent")
+    normalize_overshoot_settings()
     use_auto_follow_mouse = obs.obs_data_get_bool(settings, "follow")
     use_follow_outside_bounds = obs.obs_data_get_bool(settings, "follow_outside_bounds")
     follow_speed = obs.obs_data_get_double(settings, "follow_speed")
@@ -2723,6 +3041,10 @@ function script_update(settings)
     elseif use_socket and (old_poll ~= socket_poll or old_port ~= socket_port) then
         stop_server()
         start_server()
+    end
+
+    if old_scale_filter_policy ~= scale_filter_policy and sceneitem ~= nil then
+        apply_scale_filter_policy()
     end
 end
 

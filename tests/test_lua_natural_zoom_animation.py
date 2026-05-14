@@ -124,6 +124,46 @@ class NaturalZoomAnimationLuaTests(unittest.TestCase):
         self.assertIn('coordinate_space = "source"', lua)
         self.assertIn('data:match("^%s*rect%s+', lua)
 
+    def test_lua_exposes_phase4_scale_filter_helper(self):
+        lua = read_lua()
+
+        self.assertRegex(lua, r"local\s+ScaleFilterPolicy\s*=\s*\{")
+        self.assertRegex(lua, r"LeaveUnchanged\s*=\s*\"leave_unchanged\"")
+        self.assertRegex(lua, r"RecommendInLog\s*=\s*\"recommend_in_log\"")
+        self.assertRegex(lua, r"TemporarilySetLanczos\s*=\s*\"temporarily_set_lanczos\"")
+        self.assertRegex(lua, r"TemporarilySetBicubic\s*=\s*\"temporarily_set_bicubic\"")
+        self.assertRegex(lua, r"local\s+scale_filter_policy\s*=\s*ScaleFilterPolicy\.LeaveUnchanged")
+        self.assertRegex(lua, r"function\s+apply_scale_filter_policy_to_item\s*\(")
+        self.assertRegex(lua, r"function\s+restore_scale_filter_policy_for_item\s*\(")
+        self.assertRegex(lua, r"function\s+apply_scale_filter_policy\s*\(")
+        self.assertRegex(lua, r"function\s+restore_scale_filter_policy\s*\(")
+        self.assertIn('"Scale Filter Policy"', lua)
+        self.assertIn('obs.obs_data_set_default_string(settings, "scale_filter_policy", ScaleFilterPolicy.LeaveUnchanged)', lua)
+        self.assertIn('scale_filter_policy = normalize_scale_filter_policy(obs.obs_data_get_string(settings, "scale_filter_policy"))', lua)
+
+    def test_lua_exposes_phase4_subtle_overshoot_controls(self):
+        lua = read_lua()
+
+        self.assertRegex(lua, r"local\s+OvershootMode\s*=\s*\{")
+        self.assertRegex(lua, r"Off\s*=\s*\"off\"")
+        self.assertRegex(lua, r"Subtle\s*=\s*\"subtle\"")
+        self.assertRegex(lua, r"local\s+overshoot_mode\s*=\s*OvershootMode\.Off")
+        self.assertRegex(lua, r"local\s+overshoot_percent\s*=\s*1\.0")
+        self.assertRegex(lua, r"local\s+overshoot_settle_ratio\s*=\s*0\.18")
+        self.assertRegex(lua, r"function\s+build_overshoot_crop\s*\(")
+        self.assertRegex(lua, r"function\s+create_overshoot_animation_options\s*\(")
+        self.assertRegex(lua, r"settle_to\s*=\s*copy_crop")
+        self.assertRegex(lua, r"camera_animation\.settle_to")
+        self.assertIn('"Zoom Overshoot"', lua)
+        self.assertIn('"Overshoot Amount (%)"', lua)
+        self.assertIn('obs.obs_data_set_default_string(settings, "overshoot_mode", OvershootMode.Off)', lua)
+        self.assertIn('obs.obs_data_set_default_double(settings, "overshoot_percent", 1.0)', lua)
+        self.assertRegex(lua, r"\[MotionPreset\.Tutorial\][\s\S]*overshoot_mode\s*=\s*OvershootMode\.Off")
+        self.assertRegex(lua, r"\[MotionPreset\.QuickFocus\][\s\S]*overshoot_mode\s*=\s*OvershootMode\.Off")
+        self.assertRegex(lua, r"\[MotionPreset\.DetailedInspection\][\s\S]*overshoot_mode\s*=\s*OvershootMode\.Off")
+        self.assertRegex(lua, r"\[MotionPreset\.ReducedMotion\][\s\S]*overshoot_mode\s*=\s*OvershootMode\.Off")
+        self.assertRegex(lua, r"\[MotionPreset\.EnergeticDemo\][\s\S]*overshoot_mode\s*=\s*OvershootMode\.Subtle")
+
     def test_lua_target_rectangle_math_when_luajit_available(self):
         if shutil.which("luajit") is None:
             self.skipTest("LuaJIT is not installed on this machine")
@@ -143,6 +183,26 @@ class NaturalZoomAnimationLuaTests(unittest.TestCase):
             msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn("OBS Lua target rectangle tests passed", result.stdout)
+
+    def test_lua_scale_filter_and_overshoot_when_luajit_available(self):
+        if shutil.which("luajit") is None:
+            self.skipTest("LuaJIT is not installed on this machine")
+
+        result = subprocess.run(
+            ["luajit", "tests/obs_lua_scale_overshoot.lua"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(
+            0,
+            result.returncode,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("OBS Lua scale filter and overshoot tests passed", result.stdout)
 
     def test_lua_has_no_merge_conflict_markers(self):
         lua = read_lua()
