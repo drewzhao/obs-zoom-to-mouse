@@ -69,6 +69,10 @@ local follow_speed = 0.1
 local follow_border = 0
 local follow_safezone_sensitivity = 10
 local use_follow_auto_lock = false
+local use_cursor_stability_delay = true
+local cursor_stability_duration_ms = 150
+local cursor_stability_max_wait_ms = 250
+local cursor_stability_threshold_px = 4
 local zoom_value = 1.45
 local legacy_zoom_speed = 0.06
 local allow_all_sources = false
@@ -177,6 +181,14 @@ local camera_animation = {
     elapsed_ms = 0,
     duration_ms = 420,
     easing = Easing.EaseOutCubic,
+}
+
+local cursor_zoom_pending = {
+    active = false,
+    elapsed_ms = 0,
+    stable_ms = 0,
+    last_center = nil,
+    target = nil,
 }
 
 local version = obs.obs_get_version_string()
@@ -748,6 +760,12 @@ local function get_animation_frame_interval_ms()
     return 16.667
 end
 
+local function normalize_cursor_stability_settings()
+    cursor_stability_duration_ms = math.max(0, cursor_stability_duration_ms or 0)
+    cursor_stability_max_wait_ms = math.max(0, cursor_stability_max_wait_ms or 0)
+    cursor_stability_threshold_px = math.max(0, cursor_stability_threshold_px or 0)
+end
+
 local function add_easing_options(prop)
     obs.obs_property_list_add_string(prop, "Linear", Easing.Linear)
     obs.obs_property_list_add_string(prop, "Ease out cubic", Easing.EaseOutCubic)
@@ -808,8 +826,17 @@ function start_zoom_timer()
     end
 end
 
+local function reset_cursor_zoom_pending()
+    cursor_zoom_pending.active = false
+    cursor_zoom_pending.elapsed_ms = 0
+    cursor_zoom_pending.stable_ms = 0
+    cursor_zoom_pending.last_center = nil
+    cursor_zoom_pending.target = nil
+end
+
 function stop_zoom_timer_if_idle()
-    if is_timer_running and camera_animation.active == false and is_following_mouse == false then
+    if is_timer_running and camera_animation.active == false and
+        cursor_zoom_pending.active == false and is_following_mouse == false then
         is_timer_running = false
         obs.timer_remove(on_timer)
     end
@@ -883,6 +910,114 @@ function update_crop_animation(elapsed_ms)
     end
 
     return camera_animation.active
+end
+
+local function copy_center(center)
+    if center == nil then
+        return nil
+    end
+
+    return { x = center.x or 0, y = center.y or 0 }
+end
+
+local function should_wait_for_cursor_stability()
+    normalize_cursor_stability_settings()
+
+    return use_cursor_stability_delay and
+        cursor_stability_duration_ms > 0 and
+        cursor_stability_max_wait_ms > 0
+end
+
+function start_zoom_in_animation(target)
+    zoom_info.zoom_to = zoom_value
+    locked_center = nil
+    locked_last_pos = nil
+    zoom_target = target or get_target_position(zoom_info)
+    start_crop_animation(ZoomState.ZoomingIn, crop_filter_info, zoom_target.crop, zoom_in_duration_ms, zoom_in_easing)
+end
+
+function start_pending_zoom_in()
+    reset_cursor_zoom_pending()
+    zoom_info.zoom_to = zoom_value
+    zoom_target = get_target_position(zoom_info)
+
+    cursor_zoom_pending.active = true
+    cursor_zoom_pending.target = zoom_target
+    cursor_zoom_pending.last_center = copy_center(zoom_target.raw_center)
+    zoom_state = ZoomState.ZoomingIn
+
+    log("Cursor stability wait started (" ..
+        "stable=" .. cursor_stability_duration_ms .. "ms, " ..
+        "max=" .. cursor_stability_max_wait_ms .. "ms, " ..
+        "threshold=" .. cursor_stability_threshold_px .. "px)")
+
+    start_zoom_timer()
+end
+
+local function finish_pending_zoom_in(message)
+    local target = cursor_zoom_pending.target
+    reset_cursor_zoom_pending()
+    log(message)
+    start_zoom_in_animation(target)
+end
+
+function update_cursor_stability_delay(elapsed_ms)
+    if cursor_zoom_pending.active == false then
+        return false
+    end
+
+    elapsed_ms = elapsed_ms or get_animation_frame_interval_ms()
+    cursor_zoom_pending.elapsed_ms = cursor_zoom_pending.elapsed_ms + elapsed_ms
+    zoom_info.zoom_to = zoom_value
+
+    local current_target = get_target_position(zoom_info)
+    local current_center = current_target.raw_center
+    local last_center = cursor_zoom_pending.last_center
+
+    if last_center ~= nil and current_center ~= nil then
+        local dx = math.abs((current_center.x or 0) - (last_center.x or 0))
+        local dy = math.abs((current_center.y or 0) - (last_center.y or 0))
+
+        if dx <= cursor_stability_threshold_px and dy <= cursor_stability_threshold_px then
+            cursor_zoom_pending.stable_ms = cursor_zoom_pending.stable_ms + elapsed_ms
+        else
+            if cursor_zoom_pending.stable_ms > 0 then
+                log("Cursor moved " .. math.floor(dx) .. "x" .. math.floor(dy) ..
+                    "px; resetting stability wait")
+            end
+            cursor_zoom_pending.stable_ms = 0
+        end
+    end
+
+    cursor_zoom_pending.last_center = copy_center(current_center)
+    cursor_zoom_pending.target = current_target
+
+    if cursor_zoom_pending.stable_ms >= cursor_stability_duration_ms then
+        finish_pending_zoom_in("Cursor stable for " ..
+            math.floor(cursor_zoom_pending.stable_ms) .. "ms; starting zoom")
+        return true
+    end
+
+    if cursor_zoom_pending.elapsed_ms >= cursor_stability_max_wait_ms then
+        finish_pending_zoom_in("Cursor stability wait capped at " ..
+            math.floor(cursor_zoom_pending.elapsed_ms) .. "ms; starting zoom")
+        return true
+    end
+
+    return true
+end
+
+function begin_zoom_in()
+    zoom_info.zoom_to = zoom_value
+    locked_center = nil
+    locked_last_pos = nil
+
+    if should_wait_for_cursor_stability() then
+        start_pending_zoom_in()
+        return
+    end
+
+    start_zoom_in_animation()
 end
 
 local function retina_log(message)
@@ -1263,6 +1398,7 @@ function release_sceneitem()
 
     zoom_state = ZoomState.None
     camera_animation.active = false
+    reset_cursor_zoom_pending()
 
     if sceneitem ~= nil then
         if crop_filter ~= nil and source ~= nil then
@@ -1645,6 +1781,7 @@ function on_toggle_zoom(pressed)
             if zoom_state == ZoomState.ZoomedIn then
                 log("Zooming out")
                 -- To zoom out, we set the target back to whatever it was originally
+                reset_cursor_zoom_pending()
                 locked_center = nil
                 locked_last_pos = nil
                 zoom_target = { crop = copy_crop(crop_filter_info_orig), c = sceneitem_crop_orig }
@@ -1656,12 +1793,7 @@ function on_toggle_zoom(pressed)
                 start_crop_animation(ZoomState.ZoomingOut, crop_filter_info, zoom_target.crop, zoom_out_duration_ms, zoom_out_easing)
             else
                 log("Zooming in")
-                -- To zoom in, we get a new target based on where the mouse was when zoom was clicked
-                zoom_info.zoom_to = zoom_value
-                locked_center = nil
-                locked_last_pos = nil
-                zoom_target = get_target_position(zoom_info)
-                start_crop_animation(ZoomState.ZoomingIn, crop_filter_info, zoom_target.crop, zoom_in_duration_ms, zoom_in_easing)
+                begin_zoom_in()
             end
         end
     end
@@ -1673,6 +1805,11 @@ function on_timer(elapsed_ms)
     end
 
     elapsed_ms = elapsed_ms or get_animation_frame_interval_ms()
+
+    if cursor_zoom_pending.active then
+        update_cursor_stability_delay(elapsed_ms)
+        return
+    end
 
     if camera_animation.active then
         update_crop_animation(elapsed_ms)
@@ -1937,6 +2074,10 @@ function log_current_settings()
         follow_border = follow_border,
         follow_safezone_sensitivity = follow_safezone_sensitivity,
         use_follow_auto_lock = use_follow_auto_lock,
+        use_cursor_stability_delay = use_cursor_stability_delay,
+        cursor_stability_duration_ms = cursor_stability_duration_ms,
+        cursor_stability_max_wait_ms = cursor_stability_max_wait_ms,
+        cursor_stability_threshold_px = cursor_stability_threshold_px,
         use_monitor_override = use_monitor_override,
         monitor_override_x = monitor_override_x,
         monitor_override_y = monitor_override_y,
@@ -1977,6 +2118,10 @@ function on_print_help()
         "Zoom In Duration: How long zoom-in animation takes in milliseconds\n" ..
         "Zoom Out Duration: How long zoom-out animation takes in milliseconds\n" ..
         "Zoom In/Out Easing: The easing curve used by each zoom direction\n" ..
+        "Cursor settle before zoom: True to wait briefly for the cursor to stop before zooming in\n" ..
+        "Cursor Stable Duration: How long the cursor must stay within the movement threshold before zoom starts\n" ..
+        "Max Cursor Wait: The longest time to wait before zooming to the latest cursor position\n" ..
+        "Cursor Movement Threshold: Movement in pixels that still counts as stable during the wait\n" ..
         "Auto follow mouse: True to track the cursor while you are zoomed in\n" ..
         "Follow outside bounds: True to track the cursor even when it is outside the bounds of the source\n" ..
         "Follow Speed: The speed at which the zoomed area will follow the mouse when tracking\n" ..
@@ -2055,6 +2200,25 @@ function script_properties()
         "Duration of the zoom-in camera animation in milliseconds")
     obs.obs_property_set_long_description(zoom_out_duration,
         "Duration of the zoom-out camera animation in milliseconds")
+
+    local cursor_props = obs.obs_properties_create()
+    local cursor_stable_duration = obs.obs_properties_add_int_slider(cursor_props,
+        "cursor_stability_duration_ms", "Cursor Stable Duration (ms)", 0, 500, 10)
+    local cursor_max_wait = obs.obs_properties_add_int_slider(cursor_props,
+        "cursor_stability_max_wait_ms", "Max Cursor Wait (ms)", 0, 1000, 10)
+    local cursor_threshold = obs.obs_properties_add_int_slider(cursor_props,
+        "cursor_stability_threshold_px", "Cursor Movement Threshold (px)", 0, 50, 1)
+    local cursor_stability = obs.obs_properties_add_group(props,
+        "cursor_stability_delay", "Cursor settle before zoom ", obs.OBS_GROUP_CHECKABLE, cursor_props)
+    obs.obs_property_set_long_description(cursor_stability,
+        "When enabled, zoom-in waits briefly for the cursor to settle or until the max wait is reached")
+    obs.obs_property_set_long_description(cursor_stable_duration,
+        "How long the cursor must stay within the movement threshold before zoom starts")
+    obs.obs_property_set_long_description(cursor_max_wait,
+        "The longest time to wait before zooming to the latest cursor position")
+    obs.obs_property_set_long_description(cursor_threshold,
+        "Maximum cursor movement that still counts as stable during the wait")
+
     local follow = obs.obs_properties_add_bool(props, "follow", "Auto follow mouse ")
     obs.obs_property_set_long_description(follow,
         "When enabled mouse traking will auto-start when zoomed in without waiting for tracking toggle hotkey")
@@ -2194,6 +2358,11 @@ function script_load(settings)
     follow_border = obs.obs_data_get_int(settings, "follow_border")
     follow_safezone_sensitivity = obs.obs_data_get_int(settings, "follow_safezone_sensitivity")
     use_follow_auto_lock = obs.obs_data_get_bool(settings, "follow_auto_lock")
+    use_cursor_stability_delay = obs.obs_data_get_bool(settings, "cursor_stability_delay")
+    cursor_stability_duration_ms = obs.obs_data_get_int(settings, "cursor_stability_duration_ms")
+    cursor_stability_max_wait_ms = obs.obs_data_get_int(settings, "cursor_stability_max_wait_ms")
+    cursor_stability_threshold_px = obs.obs_data_get_int(settings, "cursor_stability_threshold_px")
+    normalize_cursor_stability_settings()
     allow_all_sources = obs.obs_data_get_bool(settings, "allow_all_sources")
     use_monitor_override = obs.obs_data_get_bool(settings, "use_monitor_override")
     monitor_override_x = obs.obs_data_get_int(settings, "monitor_override_x")
@@ -2243,6 +2412,7 @@ end
 
 function script_unload()
     is_script_loaded = false
+    reset_cursor_zoom_pending()
 
     -- Clean up the memory usage
     if obs_version_at_least(29, 1, 3) then -- 29.1.2 and below seems to crash if you do this, so we ignore it as the script is closing anyway
@@ -2287,6 +2457,10 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "follow_border", 8)
     obs.obs_data_set_default_int(settings, "follow_safezone_sensitivity", 4)
     obs.obs_data_set_default_bool(settings, "follow_auto_lock", false)
+    obs.obs_data_set_default_bool(settings, "cursor_stability_delay", true)
+    obs.obs_data_set_default_int(settings, "cursor_stability_duration_ms", 150)
+    obs.obs_data_set_default_int(settings, "cursor_stability_max_wait_ms", 250)
+    obs.obs_data_set_default_int(settings, "cursor_stability_threshold_px", 4)
     obs.obs_data_set_default_bool(settings, "allow_all_sources", false)
     obs.obs_data_set_default_bool(settings, "use_monitor_override", false)
     obs.obs_data_set_default_int(settings, "monitor_override_x", 0)
@@ -2352,6 +2526,11 @@ function script_update(settings)
     follow_border = obs.obs_data_get_int(settings, "follow_border")
     follow_safezone_sensitivity = obs.obs_data_get_int(settings, "follow_safezone_sensitivity")
     use_follow_auto_lock = obs.obs_data_get_bool(settings, "follow_auto_lock")
+    use_cursor_stability_delay = obs.obs_data_get_bool(settings, "cursor_stability_delay")
+    cursor_stability_duration_ms = obs.obs_data_get_int(settings, "cursor_stability_duration_ms")
+    cursor_stability_max_wait_ms = obs.obs_data_get_int(settings, "cursor_stability_max_wait_ms")
+    cursor_stability_threshold_px = obs.obs_data_get_int(settings, "cursor_stability_threshold_px")
+    normalize_cursor_stability_settings()
     allow_all_sources = obs.obs_data_get_bool(settings, "allow_all_sources")
     use_monitor_override = obs.obs_data_get_bool(settings, "use_monitor_override")
     monitor_override_x = obs.obs_data_get_int(settings, "monitor_override_x")

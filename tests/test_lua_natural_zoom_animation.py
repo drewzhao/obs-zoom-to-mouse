@@ -79,6 +79,39 @@ class NaturalZoomAnimationLuaTests(unittest.TestCase):
         self.assertRegex(lua, r"x\s*=\s*mouse\.x\s*-\s*new_size\.width\s*\*\s*target_screen_x")
         self.assertRegex(lua, r"y\s*=\s*mouse\.y\s*-\s*new_size\.height\s*\*\s*target_screen_y")
 
+    def test_lua_exposes_cursor_coordination_controls(self):
+        lua = read_lua()
+
+        self.assertRegex(lua, r"local\s+use_cursor_stability_delay\s*=\s*true")
+        self.assertRegex(lua, r"local\s+cursor_stability_duration_ms\s*=\s*150")
+        self.assertRegex(lua, r"local\s+cursor_stability_max_wait_ms\s*=\s*250")
+        self.assertRegex(lua, r"local\s+cursor_stability_threshold_px\s*=\s*4")
+        self.assertIn('"Cursor settle before zoom "', lua)
+        self.assertIn('"Cursor Stable Duration (ms)"', lua)
+        self.assertIn('"Max Cursor Wait (ms)"', lua)
+        self.assertIn('"Cursor Movement Threshold (px)"', lua)
+        self.assertIn('obs.obs_data_set_default_bool(settings, "cursor_stability_delay", true)', lua)
+        self.assertIn('obs.obs_data_set_default_int(settings, "cursor_stability_duration_ms", 150)', lua)
+        self.assertIn('obs.obs_data_set_default_int(settings, "cursor_stability_max_wait_ms", 250)', lua)
+        self.assertIn('obs.obs_data_set_default_int(settings, "cursor_stability_threshold_px", 4)', lua)
+        self.assertIn('use_cursor_stability_delay = obs.obs_data_get_bool(settings, "cursor_stability_delay")', lua)
+        self.assertIn('cursor_stability_duration_ms = obs.obs_data_get_int(settings, "cursor_stability_duration_ms")', lua)
+        self.assertIn('cursor_stability_max_wait_ms = obs.obs_data_get_int(settings, "cursor_stability_max_wait_ms")', lua)
+        self.assertIn('cursor_stability_threshold_px = obs.obs_data_get_int(settings, "cursor_stability_threshold_px")', lua)
+
+    def test_lua_waits_for_cursor_stability_before_zooming_in(self):
+        lua = read_lua()
+
+        self.assertRegex(lua, r"local\s+cursor_zoom_pending\s*=\s*\{")
+        self.assertRegex(lua, r"function\s+start_pending_zoom_in\s*\(")
+        self.assertRegex(lua, r"function\s+update_cursor_stability_delay\s*\(")
+        self.assertRegex(lua, r"cursor_zoom_pending\.stable_ms\s*=\s*cursor_zoom_pending\.stable_ms\s*\+\s*elapsed_ms")
+        self.assertRegex(lua, r"cursor_zoom_pending\.elapsed_ms\s*>=\s*cursor_stability_max_wait_ms")
+        self.assertRegex(lua, r"function\s+begin_zoom_in\s*\([\s\S]*start_pending_zoom_in\(\)")
+        self.assertRegex(lua, r"function\s+on_timer\s*\(elapsed_ms\)[\s\S]*update_cursor_stability_delay\(elapsed_ms\)")
+        self.assertIn("Cursor stable", lua)
+        self.assertIn("Cursor stability wait capped", lua)
+
     def test_lua_has_no_merge_conflict_markers(self):
         lua = read_lua()
 
