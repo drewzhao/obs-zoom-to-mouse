@@ -17,6 +17,7 @@ The goal is not to add flashy camera motion. The goal is to make the zoom behave
 The guide makes good sense for this project. Most recommendations map directly to the current Lua architecture because the script already behaves like a virtual camera over a display capture source. It calculates a target crop rectangle from the mouse position and animates OBS Crop/Pad filter settings over time.
 
 Approximately 80-85% of the guide can be implemented cleanly in Lua without changing OBS Studio. The remaining items require either semantic UI information, operating-system input hooks, or a custom OBS filter/plugin.
+With the cursor-coordination milestone implemented, the current Lua path is at the upper end of that estimate for screen-recording zoom behavior.
 
 Recommended first implementation:
 
@@ -27,7 +28,7 @@ Recommended first implementation:
 5. Add target framing bias so the mouse target can settle slightly above center.
 6. Lower default zoom factor from `2.0x` to a more natural tutorial value such as `1.45x`.
 7. Keep overshoot disabled by default.
-8. Add reduced-motion and optional cursor-stability delay after the core animation model is stable.
+8. Add reduced-motion and cursor-stability delay after the core animation model is stable.
 
 ## Implementation Status
 
@@ -41,7 +42,7 @@ Current implementation pass:
 | OBS load and live toggle smoke | Complete | OBS 32.0.4 loaded the script, rendered the new controls, and toggled zoom in/out through the saved `Ctrl+1` hotkey. |
 | Legacy profile preset migration | Complete | Existing profiles with old `zoom_value` or `zoom_speed` settings are marked `Custom` unless a motion preset was explicitly saved. |
 | Tutorial preset motion validation | Complete | OBS live validation used the `Tutorial` preset at `1.45x`, `420ms` zoom-in, and `320ms` zoom-out for repeated hotkey cycles. |
-| Cursor coordination delay | Deferred | This remains a later phase because it adds interaction timing state. |
+| Cursor coordination delay | Complete | Static contract tests verify the settings and pending wait state; live OBS validation confirmed the `150ms` cursor-stability wait before zoom-in. |
 | Overshoot/advanced polish | Deferred | This remains optional and should stay disabled by default. |
 
 Verification commands used for the current pass:
@@ -69,6 +70,18 @@ Tutorial preset motion validation:
 - With debug logging temporarily enabled, repeated `Ctrl+1` cycles logged `Zooming in`, `Zoomed in`, `Tracking mouse is on`, `Zooming out`, and `Zoomed out`.
 - The preview returned to normal framing after each cycle, and debug logging was disabled after validation so normal OBS use does not keep opening the script log.
 - This was a live visual/runtime validation, not a frame-by-frame recorded motion analysis. A recorded 30 FPS/60 FPS comparison remains the next deeper quality gate if the tutorial preset needs fine tuning.
+
+Cursor coordination implementation validation:
+
+- `Cursor settle before zoom` is now a checkable OBS setting, enabled by default.
+- The default settle behavior waits for `150ms` of stable cursor movement, with a `250ms` max wait and `4px` movement threshold.
+- The zoom-in hotkey now enters a pending state before animation. The timer samples the latest cursor-derived target, starts zoom when the cursor is stable, or starts zoom at the latest cursor position when the max wait is reached.
+- Debug logging records when the stability wait starts, when movement resets the wait, when the cursor is stable, and when the max wait cap starts the zoom.
+- Automated validation has passed through `python3 -m unittest discover -v` and `luajit tests/obs_lua_smoke.lua`.
+- Live OBS validation on this machine reloaded the script, rendered the new cursor-settle group, and showed `Cursor settle before zoom` enabled with `150ms` stable duration, `250ms` max wait, and `4px` threshold.
+- With debug logging temporarily enabled, a `Ctrl+1` zoom-in cycle logged `Cursor stability wait started (stable=150ms, max=250ms, threshold=4px)`, then `Cursor stable for 166ms; starting zoom`, then `Zoomed in`.
+- The matching `Ctrl+1` zoom-out cycle logged `Zooming out`, `Tracking mouse is off (due to zoom out)`, and `Zoomed out`; the preview returned to normal framing.
+- Debug logging was disabled again after validation.
 
 ## Baseline Implementation Findings
 
@@ -293,14 +306,14 @@ Expose these as advanced settings only if needed. In the first implementation, c
 
 ### Cursor Stability Delay
 
-Optional later enhancement:
+Implemented enhancement:
 
 1. User presses zoom hotkey.
-2. Script samples cursor movement for `100-200ms`.
+2. Script samples cursor movement for `150ms` by default.
 3. If cursor is stable enough, start zoom.
-4. If cursor keeps moving, either wait up to a cap or zoom to the latest position.
+4. If cursor keeps moving, wait up to the `250ms` default cap, then zoom to the latest position.
 
-This makes zooms feel intentional, but it adds state complexity. Implement after the duration/easing refactor.
+This makes zooms feel intentional while bounding the added latency. The delay can be disabled through the `Cursor settle before zoom` group.
 
 ### Overshoot
 
@@ -360,6 +373,8 @@ Stop condition:
 - Old saved settings do not break script loading.
 
 ### Phase 3: Cursor Coordination
+
+Status: Implemented in the current branch.
 
 Scope:
 
