@@ -1,208 +1,276 @@
-# macOS Retina Display Fix (v1.2.0)
+# macOS Retina and Display-Coordinate Handling
 
-## Bug Description
+This document explains the current macOS Retina / HiDPI coordinate handling in the maintained Lua implementation, `obs-zoom-to-mouse.lua`.
 
-**Issue:** Zoom was not centering on the mouse correctly on macOS Retina displays. The offset error was more prominent when the cursor was in the lower half of the screen.
+It is written as a current reference, not as a historical bug report. The old Retina centering bug is still described near the end because it explains why the current detection pipeline exists.
 
-**Affected Versions:** v1.1.1 and earlier
+## Current Status
 
-**Platform:** macOS with Retina displays (2x or higher backing scale factor)
+The Lua script is the only maintained runtime.
 
----
+On macOS, the script supports:
 
-## Root Cause Analysis
+- automatic display-capture geometry detection;
+- per-display `display_uuid` lookup;
+- `NSScreen` frame and backing-scale detection;
+- fallback display-name parsing;
+- user-selectable Retina interpretation modes;
+- manual source-position override for edge cases.
 
-### The Coordinate Space Mismatch
+The current implementation is designed to handle mixed Retina and non-Retina monitor layouts without assuming that the main screen is the captured screen.
 
-On macOS, there are two different coordinate spaces at play:
+## Why This Is Needed
 
-| Coordinate Space | Unit | Example (5K Retina) | Used By |
-|------------------|------|---------------------|---------|
-| **Points** (logical) | pt | 2560×1440 | `NSEvent.mouseLocation`, display names in OBS |
-| **Pixels** (physical) | px | 5120×2880 | OBS source capture, crop filter |
+macOS and OBS expose display information through different coordinate systems.
 
-The bug occurred because the script was mixing these coordinate spaces incorrectly.
+| Data | Typical Unit | Typical Origin | Used For |
+|------|--------------|----------------|----------|
+| `NSEvent.mouseLocation` | logical points | bottom-left global screen space | local cursor position |
+| `NSScreen.frame` | logical points | bottom-left global screen space | display position and logical size |
+| OBS display-capture source size | pixels | top-left source space | Crop/Pad and zoom math |
+| OBS display list label | usually logical points, but classified defensively | label text only | fallback geometry parsing |
 
-### How macOS Reports Display Information
+The script must turn a macOS point-space mouse coordinate into a source pixel coordinate before it can calculate the Crop/Pad rectangle used for zooming.
 
-1. **OBS Display Name:** Reports dimensions in **points** (e.g., `"Studio Display: 2560x1440 @ 0,0"`)
-   - This comes from `NSScreen.frame.size` which is in the point coordinate system
+## Current Detection Pipeline
 
-2. **OBS Source Dimensions:** Reports in **pixels** (e.g., `5120x2880`)
-   - This comes from `CGDisplayModeGetPixelWidth/Height` or the actual captured frame
+The central function is `get_monitor_info(source, source_pixels)`.
 
-3. **Mouse Position (`NSEvent.mouseLocation`):** Returns coordinates in **points**
-   - Origin is at the **bottom-left** of the primary display
-   - Y-axis increases **upward** (opposite of most graphics systems)
+For display-capture sources on macOS, the script follows this order:
 
-### The Specific Bug
+1. Read the selected OBS display-capture property.
+   - Modern macOS capture sources use `display_uuid`.
+   - The display list item label is also read so it can be parsed if needed.
+2. Try native display lookup.
+   - Convert `display_uuid` to `CGDirectDisplayID`.
+   - Match that display ID to an `NSScreen`.
+   - Read that screen's `frame` and `backingScaleFactor`.
+3. In `Auto` mode, use native geometry immediately when available.
+   - This is the preferred path because it identifies the captured screen directly.
+4. If native geometry is unavailable, or if the user selected a force mode, parse the OBS display list label.
+   - The parser extracts `width`, `height`, `x`, and `y` from labels shaped like `Display Name: 2560x1440 @ 0,0`.
+   - The parsed dimensions are then interpreted by `derive_macos_display_metrics(...)`.
+5. If parsing fails but native geometry exists, fall back to native geometry as a last resort.
+6. If automatic detection cannot produce usable geometry, the script asks the user to enable `Set manual source position`.
 
-The script's Y-coordinate transformation was using the wrong height value:
+ASCII flow:
 
-```lua
--- Y-flip to convert from bottom-left origin to top-left origin
-mouse.y = display_height - point.y
+```text
+OBS source settings
+        |
+        v
+selected display_uuid
+        |
+        +--> CGDisplayGetDisplayIDFromUUID
+                 |
+                 v
+             matching NSScreen
+                 |
+                 v
+             frame + backingScaleFactor
+
+OBS display list label
+        |
+        v
+parse "WxH @ x,y"
+        |
+        v
+classify as points or pixels when native geometry is unavailable or force mode is selected
 ```
 
-In v1.1.1, the code incorrectly set:
-```lua
-info.display_height = info.height / backing_scale  -- WRONG!
--- e.g., 1440 / 2 = 720
+## Retina Detection Modes
+
+`Retina detection mode` appears in the OBS Scripts UI on macOS.
+
+| Mode | Behavior | When to Use |
+|------|----------|-------------|
+| `Auto (recommended)` | Prefer native `display_uuid` -> `NSScreen` geometry. If that is unavailable, classify the parsed display label using source-size ratios and backing scale. | Normal use. Start here. |
+| `Force display name as points` | Parse the OBS display list label and treat its `WxH` dimensions as logical points. | Use when auto fallback misclassifies a label that you know is in point space. |
+| `Force display name as pixels` | Parse the OBS display list label and treat its `WxH` dimensions as physical pixels, deriving logical display height/width by dividing by backing scale. | Use when auto fallback misclassifies a label that you know is in pixel space. |
+
+Force modes are only meaningful when the script can parse the OBS display label. If parsing fails, the script may still use native geometry as a last resort.
+
+## Parsed-Name Classification
+
+When the script has to classify parsed label dimensions, it compares the OBS source size against the parsed display-list size.
+
+| Case | Example | Script Interpretation |
+|------|---------|----------------------|
+| Source-to-label ratio is close to the backing scale | source `5120x2880`, parsed `2560x1440`, scale `2.0` | Parsed label is point-sized. |
+| Source-to-label ratio is close to `1` | source `3840x2160`, parsed `3840x2160`, scale `2.0` | Parsed label is pixel-sized. |
+| Ratio is between `1` and `3` but does not match exactly | unusual scaled display mode | Derive a rounded scale from the ratios. |
+| Source dimensions unavailable | source width/height are `0` or missing | Fall back to point-space interpretation. |
+
+The current code uses a tolerance when comparing ratios so small OBS/macOS rounding differences do not break detection.
+
+## Current Coordinate Pipeline
+
+After `monitor_info` is available, `get_mouse_source_point(zoom)` maps the mouse into source space.
+
+The current Lua order is:
+
+```text
+1. Read mouse position from NSEvent.mouseLocation.
+   - Units: logical points.
+   - Origin: bottom-left global macOS screen space.
+
+2. Convert to local display point coordinates.
+   local_x = mouse.x - monitor_info.x
+   local_y = mouse.y - monitor_info.y
+
+3. Flip Y into top-left display-local space.
+   display_height = monitor_info.display_height or monitor_info.height
+   mouse.y = display_height - local_y
+
+4. Subtract source Crop/Pad offsets already applied before zoom.
+   mouse.x = mouse.x - zoom.source_crop_filter.x
+   mouse.y = mouse.y - zoom.source_crop_filter.y
+
+5. Convert point-space movement to source pixels.
+   mouse.x = mouse.x * monitor_info.scale_x
+   mouse.y = mouse.y * monitor_info.scale_y
+
+6. Use the resulting source-space point for zoom target calculation.
 ```
 
-This caused:
-- `display_height = 720` (incorrect, should be 1440)
-- Mouse at top (point.y = 1440): `720 - 1440 = -720` → clamped/wrong
-- Mouse at bottom (point.y = 0): `720 - 0 = 720` → wrong (should be 1440)
+This order matters. The Y flip happens after subtracting the display's macOS global `y` offset, and Crop/Pad offsets are subtracted before the final scale is applied.
 
-The error increased linearly from top to bottom of the screen.
+## Manual Source Position on macOS
 
----
+Manual source position bypasses automatic display detection.
 
-## The Fix
+Use it when:
 
-### Key Insight
+- the selected source is not a display-capture source;
+- the display list cannot be parsed;
+- native lookup fails and auto detection is visibly offset;
+- you are zooming a cloned, cropped, or scaled source.
 
-On macOS, the numbers shown in an OBS display name (e.g. `“Studio Display: 2560x1440 @ 0,0”`) may be reported in **points** *or* in **pixels** depending on the monitor, macOS scaling mode, and which capture backend is being used. The script therefore has to *classify* the coordinate space before it can convert mouse points into captured pixels.
+For macOS manual override, the fields should describe the desktop/display area represented by the source in the same logical coordinate space as macOS mouse coordinates before scaling. `Monitor Height` is especially important because the script uses it to flip Y from macOS bottom-left space into top-left source space.
 
-### Detection Pipeline (v1.3.0+)
+Practical guidance:
 
-1. **Collect observations**
-   - `display_uuid` – from the selected OBS display-capture source.
-   - Native `NSScreen.frame` and `NSScreen.backingScaleFactor` – resolved from the display UUID when possible.
-   - `parsed_width/height` – from the OBS display name.
-   - `source_width/height` – actual pixels reported by the display-capture source.
-2. **Native UUID lookup (Auto mode)**
-   - Convert the OBS `display_uuid` to a `CGDirectDisplayID`.
-   - Match that display ID to the corresponding `NSScreen`.
-   - Use that screen's frame for logical point coordinates and that screen's backing scale for point-to-pixel conversion.
-3. **Parsed-name fallback**
-   - If `source / parsed ≈ backing_scale`: the name is in **points** (logical coordinates).
-   - If `source / parsed ≈ 1`: the name is already in **pixels**; divide by the backing scale to recover logical coordinates.
-   - Otherwise, derive a reasonable scale from the ratios (rounded to the nearest 0.5) or fall back to assuming points when data is missing.
-4. **User override**
-   - A *Retina detection mode* dropdown lets users force either display-name interpretation when auto mode can’t deduce it.
-5. **Manual override**
-   - “Set manual source position” still bypasses auto detection entirely for edge cases.
+- Prefer automatic detection for real display-capture sources.
+- Start with `Retina detection mode = Auto`.
+- Use debug logging before manual override.
+- If the target is vertically inverted or offset on a secondary display, check `Y`, `Monitor Height`, and `Scale Y`.
+- If the target is consistently too far from the cursor by a Retina factor, check `Scale X` and `Scale Y`.
 
-### New Retina Detection Modes
+## Debug Logging
 
-| Mode | Description | Typical Use Case |
-|------|-------------|------------------|
-| `Auto (recommended)` | Uses native UUID-to-`NSScreen` geometry first, then falls back to parsed-name classification. | Works for most setups, including mixed Retina/non-Retina multi-monitor layouts. |
-| `Force display name as points` | Treats `WxH` from the display name as logical points. | Matches the v1.2.x behavior; useful if OBS always reports point dimensions on a particular Mac. |
-| `Force display name as pixels` | Treats `WxH` as physical pixels and divides by the backing scale to get point coordinates. | Needed on some external 4K panels where OBS lists the native resolution even though the UI is scaled. |
+Enable `Enable debug logging` in the OBS Scripts UI when diagnosing Retina behavior.
 
-### Logging Improvements
+Useful log examples:
 
-With “Enable debug logging” turned on, you now get detailed breadcrumbs in the script log:
-
-```
+```text
 [Retina] Selected display_uuid: 37D8832A-2D66-02CA-B9F7-8F30A301B230
 [Retina] Resolved display_uuid to display_id: 1
 [Retina] Native display geometry: uuid=37D8832A-2D66-02CA-B9F7-8F30A301B230, display_id=1, frame=2560x1440 @ 0,0, scale=2.000
 [Retina] Final monitor_info source: native_uuid
 ```
 
-```
+```text
 [Retina] Native display lookup failed: display_uuid did not resolve to a display
 [Retina] Retina: mode=auto, parsed=2560x1440, source=5120x2880, backing_scale=2.000
 [Retina] Auto: display name matches point space (ratio ≈ backing scale) (points, scale=2.000)
 ```
 
-```
+```text
 [Retina] Retina: mode=auto, parsed=3840x2160, source=3840x2160, backing_scale=2.000
 [Retina] Auto: display name already reports pixel dimensions (pixels, scale=2.000)
 ```
 
-```
+```text
 [Retina] Retina: mode=force_pixels, parsed=2940x1912, source=5880x3824, backing_scale=2.000
 [Retina] Retina mode forced to pixels (pixels, scale=2.000)
 ```
 
-These logs make it easy to verify which model the script chose on each Mac.
+The most important line is `Final monitor_info source`:
 
-### Per-Display Backing Scale Factor Detection
+| Source | Meaning |
+|--------|---------|
+| `native_uuid` | The script used `display_uuid` -> `NSScreen` geometry. This is the preferred auto path. |
+| `parsed_name` | The script parsed the OBS display label and classified its dimensions. |
+| `manual_override` | `Set manual source position` is enabled and automatic detection is bypassed. |
 
-In Auto mode, the script resolves OBS's selected `display_uuid` to the captured `NSScreen` and reads that screen's `backingScaleFactor`. This avoids using `[NSScreen mainScreen]`, which can be the wrong display on mixed-DPI multi-monitor setups. If the native lookup fails, the script falls back to the parsed-name classifier and the main-screen scale fallback.
+## Troubleshooting
 
----
+### Zoom lands at the wrong vertical position
 
-## Coordinate Transformation Pipeline (Reference)
+Likely causes:
 
-Once the display’s logical size is known, mouse coordinates flow through the system as follows:
+- the display height is in the wrong coordinate space;
+- the selected display is not the display that OBS is capturing;
+- manual override `Monitor Height` is wrong;
+- manual override `Y` does not match macOS global point coordinates.
 
+Start by enabling debug logging and checking `Final monitor_info source`, `display_height`, and `scale_y`.
+
+### Zoom is offset by roughly 2x
+
+Likely causes:
+
+- parsed point dimensions were treated as pixels;
+- parsed pixel dimensions were treated as points;
+- manual override scale is wrong.
+
+Try `Auto` first, then test `Force display name as points` or `Force display name as pixels` if auto fallback is not choosing the right model.
+
+### Mixed-DPI monitors behave differently
+
+This is exactly why native display lookup exists. In `Auto` mode, the script tries to read the backing scale from the captured `NSScreen`, not from `[NSScreen mainScreen]`.
+
+If native lookup fails, parsed-name fallback may use the main-screen backing scale. In that case, a force mode or manual override may be needed.
+
+### Non-display sources are offset
+
+Automatic Retina detection is built for display-capture sources. For arbitrary window, browser, scene, or cloned sources, enable `Set manual source position` and provide the represented source geometry explicitly.
+
+## OBS Source Context
+
+The script's behavior is shaped by OBS macOS capture internals:
+
+- `plugins/mac-capture/mac-sck-common.m` builds macOS ScreenCaptureKit display list labels from `NSScreen.frame`, which is point-space geometry.
+- `plugins/mac-capture/mac-sck-video-capture.m` configures display stream width and height from `CGDisplayModeGetPixelWidth/Height`, which are pixel dimensions for the captured display mode.
+- Older `mac-display-capture.m` code paths also expose display UUIDs and display labels, but source dimensions and crop behavior can differ by capture path and OBS/macOS version.
+
+The Lua script therefore uses both selected-display identity and source-size comparison instead of trusting a single displayed label.
+
+## Legacy Bug This Replaced
+
+Older versions mixed display point dimensions and source pixel dimensions incorrectly.
+
+The critical bug was using a scaled-down height for the Y flip:
+
+```lua
+-- Wrong legacy behavior
+info.display_height = info.height / backing_scale
+mouse.y = display_height - point.y
 ```
-1. NSEvent.mouseLocation -- returns (x, y) in POINTS, bottom-left origin
-2. Y-flip: mouse.y = display_height - point.y  -- converts to top-left origin
-3. Subtract monitor offsets (multi-monitor layouts)
-4. Apply scale factor: mouse.x *= scale_x, mouse.y *= scale_y  -- convert to pixels
-5. Use the pixel-space coordinates for crop calculations
-```
 
----
+On a 5K Retina display where the logical size is `2560x1440` and the source is `5120x2880`, this could produce a `display_height` such as `720` instead of `1440`. The result was a vertical error that became more visible toward the lower half of the screen.
 
-## Workaround (For Older Versions)
+The current script avoids this by keeping a logical `display_height` for the Y flip and applying the point-to-pixel scale later in the pipeline.
 
-If you cannot update to v1.2.0, you can use **"Set manual source position"**:
+## Version Notes
 
-1. Enable "Set manual source position" checkbox
-2. Set **Width** and **Height** to your display's **point** dimensions (e.g., 2560×1440)
-3. Set **Monitor Width** and **Monitor Height** to the same values
-4. Set **Scale X** and **Scale Y** to your backing scale factor (usually 2.0 for Retina)
+| Area | Current Status |
+|------|----------------|
+| Lua implementation | Maintained. Uses native UUID lookup, parsed-name fallback, Retina detection modes, and manual override. |
+| Python implementation | Removed. It used the same OBS Crop/Pad rendering path while adding a second runtime and dependency stack. |
+| Automated tests | The current Lua smoke and contract tests do not emulate real macOS Retina hardware. Live OBS verification with debug logging is still the best end-to-end check for display-coordinate issues. |
 
-This manually provides the correct values that the automatic detection was getting wrong.
+## Verification Checklist
 
----
+On a Mac, verify with a real OBS display-capture source:
 
-## Testing
+1. Set `Retina detection mode` to `Auto`.
+2. Enable debug logging.
+3. Reload the script or refresh the zoom source.
+4. Confirm the log shows either `native_uuid` or a sensible parsed-name classification.
+5. Move the cursor to the center of the captured display and toggle zoom.
+6. Repeat near each corner of the captured display.
+7. Test a secondary monitor if the machine uses mixed-DPI displays.
+8. Disable debug logging after diagnosis.
 
-To verify the fix works correctly:
-
-1. Move cursor to the **center** of screen → Zoom should center on cursor
-2. Move cursor to **top-left** corner → Zoom should show top-left
-3. Move cursor to **bottom-right** corner → Zoom should show bottom-right
-4. Enable "Follow mouse" and move cursor around → Zoom should smoothly follow
-
-The zoom center should match the cursor position regardless of where on the screen you click.
-
----
-
-## Technical References
-
-### OBS Source Code (macOS Display Capture)
-
-- `plugins/mac-capture/mac-sck-common.m`: Display name generation using `NSScreen.frame.size` (points)
-- `plugins/mac-capture/mac-sck-video-capture.m`: Source dimensions using `CGDisplayModeGetPixelWidth/Height` (pixels)
-
-### Apple Documentation
-
-- [NSScreen.backingScaleFactor](https://developer.apple.com/documentation/appkit/nsscreen/1388385-backingscalefactor)
-- [NSEvent.mouseLocation](https://developer.apple.com/documentation/appkit/nsevent/1533416-mouselocation)
-- [High Resolution Guidelines](https://developer.apple.com/library/archive/documentation/GraphicsAnimation/Conceptual/HighResolutionOSX/Explained/Explained.html)
-
----
-
-## Version History
-
-### Lua Version
-
-| Version | Status | Notes |
-|---------|--------|-------|
-| v1.0.x | Buggy | No Retina support |
-| v1.1.0 | Buggy | Added Retina detection (fallback method only) |
-| v1.1.1 | Buggy | Attempted fix with incorrect display_height calculation |
-| v1.2.0 | **Fixed** | Direct backing scale detection + correct coordinate handling |
-
-### Removed Python Version
-
-| Version | Status | Notes |
-|---------|--------|-------|
-| v2.0.0-v2.1.0 | Removed | The Python implementation used the same Crop/Pad rendering path as Lua while adding Python runtime and dependency setup. The project now keeps Lua as the single maintained implementation. |
-
----
-
-## Contributors
-
-- Original bug report and testing: User community
-- Lua fix implementation: v1.2.0
+Expected result: the zoom target should align with the cursor in source space, and the frame should remain stable after zoom-in.
