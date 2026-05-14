@@ -43,12 +43,14 @@ Current implementation pass:
 | Legacy profile preset migration | Complete | Existing profiles with old `zoom_value` or `zoom_speed` settings are marked `Custom` unless a motion preset was explicitly saved. |
 | Tutorial preset motion validation | Complete | OBS live validation used the `Tutorial` preset at `1.45x`, `420ms` zoom-in, and `320ms` zoom-out for repeated hotkey cycles. |
 | Cursor coordination delay | Complete | Static contract tests verify the settings and pending wait state; live OBS validation confirmed the `150ms` cursor-stability wait before zoom-in. |
-| Overshoot/advanced polish | Deferred | This remains optional and should stay disabled by default. |
+| Phase 4A target rectangle support | Complete | Static contract tests and LuaJIT math tests verify source-coordinate rectangle crop derivation, edge clamping, large-rectangle behavior, and legacy point targeting. |
+| Phase 4B/4C scale-filter helper and overshoot | Deferred | These remain optional and should stay disabled by default unless recorded output proves the need. |
 
 Verification commands used for the current pass:
 
 ```bash
 luajit tests/obs_lua_smoke.lua
+luajit tests/obs_lua_target_rect.lua
 python3 -m unittest discover -v
 PYTHONPYCACHEPREFIX=/private/tmp/obs-zoom-to-mouse-pycache python3 -m py_compile tests/test_lua_natural_zoom_animation.py
 python3 -B -m unittest tests.test_lua_natural_zoom_animation -v
@@ -395,20 +397,193 @@ Stop condition:
 
 ### Phase 4: Optional Advanced Polish
 
+Status: Researched against the local OBS Studio source checkout. Phase 4A target-rectangle support is implemented in the current branch; scale-filter automation, overshoot, timer/tick rewiring, and custom shader/plugin work remain optional and deferred until recorded validation proves they are needed.
+
+OBS source-code findings below use paths relative to the OBS Studio source root:
+
+| Area | Source Evidence | Practical Meaning |
+|------|-----------------|-------------------|
+| Crop/Pad filter contract | `plugins/obs-filters/crop-filter.c:69-80` reads `relative`, `left`, `top`, `right`, `bottom`, `cx`, and `cy` from filter settings. `plugins/obs-filters/crop-filter.c:122-156` converts those settings into shader UV scale/offset values. `plugins/obs-filters/crop-filter.c:285-296` registers the filter as `crop_filter` with video tick/render callbacks. | The current Lua strategy is aligned with OBS's built-in filter model. Phase 4 does not need an OBS Studio source patch for target rectangles, overshoot, or better timing behavior. |
+| Crop precision limit | `plugins/obs-filters/crop-filter.c:73-79` casts settings to integers, and the filter properties expose integer controls in `plugins/obs-filters/crop-filter.c:106-111`. | Lua-side polish remains integer crop animation. This is acceptable for natural screen-recording zooms, but it means Phase 4 should not promise subpixel camera movement. |
+| Crop rendering path | `plugins/obs-filters/data/crop_filter.effect:6-15` uses `mul_val` and `add_val` with a linear sampler, and `plugins/obs-filters/crop-filter.c:217-244` renders the filtered output at the computed crop width and height. | Overshoot and rectangle framing should be expressed as crop rectangles. A custom shader/plugin is only justified if recorded output shows text softness or jitter that cannot be solved with sane zoom limits and scene scale filtering. |
+| Source update path | `libobs/obs-source.c:1066-1080` applies settings through `obs_source_update` and defers video-source updates into OBS's update path. | Updating the Crop/Pad filter settings from Lua is a normal OBS API path. The current implementation can stay with `obs_source_update`. |
+| Scene item scale filters | `libobs/obs.h:124-130` defines `OBS_SCALE_DISABLE`, `POINT`, `BICUBIC`, `BILINEAR`, `LANCZOS`, and `AREA`. `libobs/obs.h:1812-1813` exports `obs_sceneitem_set_scale_filter` and `obs_sceneitem_get_scale_filter`. `libobs/obs-scene.c:754-774` selects bicubic, lanczos, or area effects during scene item rendering. | Scale-filter polish is available at the scene-item layer, not inside the Crop/Pad filter itself. It can improve the final stretch of the cropped source, but changing it mutates scene item state and must be opt-in or documentation-only. |
+| Scale filter persistence and UI | `libobs/obs-scene.c:1214-1227` loads the scene item's `scale_filter` string, and `libobs/obs-scene.c:1380-1393` saves it. `frontend/widgets/OBSBasic_SceneItems.cpp:377-393` exposes the same choices in the OBS scale filtering menu. | The report should treat scale filtering as a user-visible OBS setting. If the script ever sets it automatically, it should preserve the previous value and restore it on release, or clearly document the persistent change. |
+| Lua scripting callbacks | `shared/obs-scripting/obs-scripting-lua.c:308-320` implements `timer_add` using OBS video-frame time. `shared/obs-scripting/obs-scripting-lua.c:1039-1080` processes Lua timers from the script tick path. `shared/obs-scripting/obs-scripting-lua.c:1008-1022` exposes timers plus tick and main-render callbacks to Lua. | The current timer-based animation is appropriate for Phase 4. A tick callback can be considered if recorded output shows timer jitter, but a main-render callback is unnecessary unless we build a custom renderer or overlay. |
+| Lua binding breadth | `shared/obs-scripting/obslua/obslua.i:14` includes `obs.h`, and `shared/obs-scripting/obslua/obslua.i:100` includes it for SWIG generation. | The scene-item scale-filter APIs are likely exposed to Lua, but the implementation must verify symbol availability in this project's OBS Lua smoke test before relying on them. |
+
 Scope:
 
-1. Add subtle overshoot option for energetic demos.
-2. Add optional target rectangle input path for remote/control integrations.
-3. Consider storing scale filter preference or documenting recommended OBS scale filter.
+1. Add an optional target-rectangle camera path for remote/control integrations.
+2. Document OBS scale-filter recommendations, then optionally add an opt-in scale-filter helper.
+3. Add a subtle overshoot option only for energetic demos.
+4. Defer custom shader/plugin work unless recorded output proves that the Crop/Pad path is the limiting factor.
+
+Recommended implementation order:
+
+1. Target rectangle support
+
+   Status: Implemented in the current branch.
+
+   This is the most useful Phase 4 item and stays fully Lua-side.
+
+   Add a semantic target model:
+
+   ```lua
+   Target = {
+       kind = "point" or "rect",
+       x = number,
+       y = number,
+       w = number,
+       h = number,
+       coordinate_space = "source",
+   }
+   ```
+
+   For a rectangle target, derive the destination crop from the rectangle instead of only from the cursor point:
+
+   ```lua
+   local source_aspect = source_width / source_height
+   local margin = target_rect_margin or 1.18
+
+   local min_w = target.w * margin
+   local min_h = target.h * margin
+   local crop_w = math.max(source_width / zoom_value, min_w, min_h * source_aspect)
+
+   crop_w = clamp(1, source_width, crop_w)
+   local crop_h = crop_w / source_aspect
+
+   local anchor_x = target.x + target.w * 0.5
+   local anchor_y = target.y + target.h * 0.5
+
+   crop.x = anchor_x - crop_w * target_screen_x
+   crop.y = anchor_y - crop_h * target_screen_y
+   crop = clamp_crop_to_source_bounds(crop)
+   ```
+
+   Notes:
+
+   - Keep `point` targets as the default path.
+   - Let remote/socket integrations provide rectangles in source coordinates first. The implemented UDP format is `rect x y width height`; the legacy `x y` point format still works.
+   - Avoid trying to infer UI elements from OBS; OBS sees captured pixels, not semantic app controls.
+   - Use the existing target framing bias so rectangles can settle slightly above center.
+   - If edge clamping moves the rectangle away from the requested bias, prefer keeping the whole rectangle visible over preserving the exact bias.
+   - Contract tests cover aspect-ratio preservation, large rectangles, edge rectangles, and cursor-point behavior remaining unchanged.
+
+2. OBS scale-filter guidance and optional helper
+
+   The first deliverable should be documentation, not automatic mutation.
+
+   Recommended user-facing guidance:
+
+   - For normal software recordings, try `Lanczos` for sharper text when the scene item is being scaled.
+   - Try `Bicubic` if `Lanczos` looks too sharp or creates ringing around text.
+   - Avoid `Point` unless recording pixel art.
+   - `Area` is mainly useful for strong downscaling, not the primary zoom-in readability case.
+
+   Optional script helper, if implemented:
+
+   ```lua
+   scale_filter_policy = "leave_unchanged" -- default
+   -- other possible values:
+   -- "recommend_in_log"
+   -- "temporarily_set_lanczos"
+   -- "temporarily_set_bicubic"
+   ```
+
+   Implementation guardrails:
+
+   - Verify `obs.obs_sceneitem_get_scale_filter`, `obs.obs_sceneitem_set_scale_filter`, and `obs.OBS_SCALE_LANCZOS` in the Lua smoke test before adding the setting.
+   - Store the original scene-item filter before changing it.
+   - Restore the original value in `release_sceneitem`, script unload, and source change paths.
+   - Keep the default as `leave_unchanged`, because OBS persists scene item scale filters in scene data.
+   - Add debug logging that says whether the script left the filter alone, recommended a value, or temporarily changed it.
+
+3. Subtle overshoot
+
+   Overshoot should remain style-specific, not professional-default behavior.
+
+   Suggested settings:
+
+   ```lua
+   overshoot_mode = "off" -- default
+   overshoot_percent = 1.0
+   overshoot_settle_ratio = 0.18
+   ```
+
+   Recommended algorithm:
+
+   1. Compute the normal final target crop.
+   2. Compute the target anchor from the final crop and the target bias:
+
+      ```lua
+      anchor_x = final_crop.x + final_crop.w * target_screen_x
+      anchor_y = final_crop.y + final_crop.h * target_screen_y
+      ```
+
+   3. Convert scale overshoot into a slightly smaller crop:
+
+      ```lua
+      local overshoot_scale = 1.0 + overshoot_percent / 100.0
+      overshoot_crop.w = final_crop.w / overshoot_scale
+      overshoot_crop.h = final_crop.h / overshoot_scale
+      overshoot_crop.x = anchor_x - overshoot_crop.w * target_screen_x
+      overshoot_crop.y = anchor_y - overshoot_crop.h * target_screen_y
+      ```
+
+   4. Clamp the overshoot crop to source bounds.
+   5. If clamping shifts the anchor noticeably, skip overshoot for that move. This avoids odd edge bounce near screen borders.
+   6. Animate in two segments:
+
+      | Segment | Duration | Target | Easing |
+      |---------|----------|--------|--------|
+      | Approach | `82%` of zoom-in duration | Overshoot crop | `ease_out_quart` |
+      | Settle | `18%` of zoom-in duration | Final crop | `ease_out_cubic` |
+
+   Guardrails:
+
+   - Enable only for `Energetic Demo` or a hidden advanced/custom setting.
+   - Cap overshoot at `1-2%`.
+   - Do not use bounce or elastic easing curves for professional presets.
+   - Do not overshoot zoom-out by default.
+   - Validate with a short recorded clip, because overshoot can look acceptable in preview but distracting after encoding.
+
+4. Timer/tick polish
+
+   Keep the existing `timer_add` path unless recorded evidence shows inconsistent frame pacing. OBS processes Lua timers from the script tick path using video-frame time, so shorter timer intervals cannot create visible sub-frame smoothness.
+
+   If a later recording shows timer jitter:
+
+   - Move animation advancement into a single `script_tick(seconds)` or `obs_add_tick_callback` path.
+   - Keep the same `camera_animation.elapsed_ms` model.
+   - Avoid `obs_add_main_render_callback` unless the script starts drawing its own overlay or custom render pass.
+
+5. Custom shader/plugin route
+
+   Defer this. OBS's Crop/Pad filter already renders through a simple shader with linear sampling, and the current script can achieve the natural-motion guide's main goals without a native plugin.
+
+   Only revisit a native filter/plugin if all of these are true:
+
+   - Recorded output still shows unacceptable text softness or integer-pixel jitter.
+   - The problem reproduces after sane zoom caps, stable end frames, and scene scale-filter tuning.
+   - The project explicitly needs fractional crop coordinates or custom sampler control.
+   - The added install/build burden is acceptable.
 
 Expected result:
 
-- More creative styles are available without compromising professional defaults.
+- Remote/control integrations can frame a whole UI region instead of only a cursor point.
+- OBS scale-filter behavior is documented clearly, with an opt-in helper available only if Lua binding verification passes.
+- Energetic demos can get a tiny sense of polish without introducing visible bounce into tutorial/professional presets.
+- The project keeps the low-maintenance Lua-only architecture unless recorded evidence justifies a native OBS plugin.
 
 Stop condition:
 
 - Professional presets remain bounce-free.
-- Overshoot is visibly subtle when enabled.
+- `Tutorial`, `Quick Focus`, `Detailed Inspection`, and `Reduced Motion` never enable overshoot implicitly.
+- Target rectangles keep the requested rectangle visible after clamping.
+- Scale-filter helper defaults to no mutation and restores any temporary change.
+- Lua smoke tests cover any new OBS API symbols before the script depends on them.
+- Recorded validation shows no distracting bounce, edge snap, or text-quality regression after export.
 
 ## Backward Compatibility
 
@@ -463,8 +638,9 @@ The current default `0.06` maps to about `280ms` at 60 FPS, which is a little fa
 
 1. macOS Retina display mapping still centers correctly.
 2. Multi-monitor offsets still work.
-3. Remote mouse socket mode still supplies target coordinates.
-4. Non-display capture with manual override still behaves as before.
+3. Remote mouse socket mode still supplies point coordinates.
+4. Remote rectangle socket mode supplies source-coordinate target rectangles and keeps the rectangle visible after clamping.
+5. Non-display capture with manual override still behaves as before.
 
 ## Risks and Mitigations
 
