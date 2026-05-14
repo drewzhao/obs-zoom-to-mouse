@@ -40,6 +40,7 @@ Current implementation pass:
 | Natural presets and target framing bias | Complete | Static contract tests verify preset settings, duration/easing controls, and biased target framing. |
 | OBS load and live toggle smoke | Complete | OBS 32.0.4 loaded the script, rendered the new controls, and toggled zoom in/out through the saved `Ctrl+1` hotkey. |
 | Legacy profile preset migration | Complete | Existing profiles with old `zoom_value` or `zoom_speed` settings are marked `Custom` unless a motion preset was explicitly saved. |
+| Tutorial preset motion validation | Complete | OBS live validation used the `Tutorial` preset at `1.45x`, `420ms` zoom-in, and `320ms` zoom-out for repeated hotkey cycles. |
 | Cursor coordination delay | Deferred | This remains a later phase because it adds interaction timing state. |
 | Overshoot/advanced polish | Deferred | This remains optional and should stay disabled by default. |
 
@@ -60,6 +61,14 @@ Live OBS verification on this machine:
 - The current profile already had `toggle_zoom_hotkey` bound to `Ctrl+1`.
 - Pressing `Ctrl+1` zoomed the `macOS Screen Capture` source in, and pressing it again restored the normal framing.
 - The active OBS log recorded `Loaded lua script: obs-zoom-to-mouse.lua` and the expected `obs-zoom-to-mouse-crop` filter on the source.
+
+Tutorial preset motion validation:
+
+- The live OBS profile was switched from legacy/custom settings to `Motion Preset = Tutorial`.
+- OBS showed the expected preset values: `Zoom Factor = 1.45`, `Zoom In Duration = 420ms`, `Zoom Out Duration = 320ms`, `Zoom In Easing = ease_out_cubic`, and `Zoom Out Easing = ease_in_out_cubic`.
+- With debug logging temporarily enabled, repeated `Ctrl+1` cycles logged `Zooming in`, `Zoomed in`, `Tracking mouse is on`, `Zooming out`, and `Zoomed out`.
+- The preview returned to normal framing after each cycle, and debug logging was disabled after validation so normal OBS use does not keep opening the script log.
+- This was a live visual/runtime validation, not a frame-by-frame recorded motion analysis. A recorded 30 FPS/60 FPS comparison remains the next deeper quality gate if the tutorial preset needs fine tuning.
 
 ## Baseline Implementation Findings
 
