@@ -12,6 +12,7 @@ local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 local socket_available, socket = pcall(require, "ljsocket")
 local socket_server = nil
 local socket_mouse = nil
+local socket_target = nil
 
 local source_name = ""
 local source = nil
@@ -109,6 +110,11 @@ local Easing = {
     EaseInOutQuart = "ease_in_out_quart",
 }
 
+local TargetKind = {
+    Point = "point",
+    Rect = "rect",
+}
+
 local motion_preset = MotionPreset.Tutorial
 local zoom_in_duration_ms = 420
 local zoom_out_duration_ms = 320
@@ -116,6 +122,7 @@ local zoom_in_easing = Easing.EaseOutCubic
 local zoom_out_easing = Easing.EaseInOutCubic
 local target_screen_x = 0.50
 local target_screen_y = 0.45
+local target_rect_margin = 1.18
 
 local MotionPresetSettings = {
     [MotionPreset.Tutorial] = {
@@ -1700,7 +1707,55 @@ end
 -- Get the target position that we will attempt to zoom towards
 ---@param zoom any
 ---@return table
-function get_target_position(zoom)
+local function get_source_size(zoom)
+    local width = zoom.source_size.width or 0
+    local height = zoom.source_size.height or 0
+
+    if width < 1 then
+        width = 1
+    end
+    if height < 1 then
+        height = 1
+    end
+
+    return width, height
+end
+
+local function get_safe_zoom_factor(zoom)
+    local factor = zoom.zoom_to or 1
+    if factor < 1 then
+        factor = 1
+    end
+
+    return factor
+end
+
+function clamp_crop_to_source_bounds(zoom, crop)
+    local source_width, source_height = get_source_size(zoom)
+
+    crop.w = clamp(1, source_width, crop.w)
+    crop.h = clamp(1, source_height, crop.h)
+    crop.x = math.floor(clamp(0, math.max(0, source_width - crop.w), crop.x))
+    crop.y = math.floor(clamp(0, math.max(0, source_height - crop.h), crop.y))
+
+    return crop
+end
+
+local function target_result(zoom, crop, raw_center, kind)
+    crop = clamp_crop_to_source_bounds(zoom, crop)
+
+    return {
+        crop = crop,
+        raw_center = raw_center,
+        clamped_center = {
+            x = math.floor(crop.x + crop.w * 0.5),
+            y = math.floor(crop.y + crop.h * 0.5)
+        },
+        target_kind = kind,
+    }
+end
+
+function get_mouse_source_point(zoom)
     local mouse = get_mouse_pos()
 
     -- If we have monitor information then we can offset the mouse by the top-left of the monitor position
@@ -1732,18 +1787,35 @@ function get_target_position(zoom)
         mouse.y = mouse.y * monitor_info.scale_y
     end
 
+    return mouse
+end
+
+function get_point_target_position(zoom, target)
+    local point
+    if target ~= nil and target.coordinate_space == "source" then
+        point = {
+            x = target.x or 0,
+            y = target.y or 0,
+        }
+    else
+        point = get_mouse_source_point(zoom)
+    end
+
+    local source_width, source_height = get_source_size(zoom)
+    local zoom_factor = get_safe_zoom_factor(zoom)
+
     -- Get the new size after we zoom
     -- Remember that because we are using a crop/pad filter making the size smaller (dividing by zoom) means that we see less of the image
     -- in the same amount of space making it look bigger (aka zoomed in)
     local new_size = {
-        width = zoom.source_size.width / zoom.zoom_to,
-        height = zoom.source_size.height / zoom.zoom_to
+        width = source_width / zoom_factor,
+        height = source_height / zoom_factor
     }
 
     -- Frame the target slightly above center by default so tutorial content has a more natural resting position.
     local pos = {
-        x = mouse.x - new_size.width * target_screen_x,
-        y = mouse.y - new_size.height * target_screen_y
+        x = point.x - new_size.width * target_screen_x,
+        y = point.y - new_size.height * target_screen_y
     }
 
     -- Create the full crop results
@@ -1754,11 +1826,57 @@ function get_target_position(zoom)
         h = new_size.height,
     }
 
-    -- Keep the zoom in bounds of the source so that we never show something outside that user is trying to hide with existing crop settings
-    crop.x = math.floor(clamp(0, (zoom.source_size.width - new_size.width), crop.x))
-    crop.y = math.floor(clamp(0, (zoom.source_size.height - new_size.height), crop.y))
+    return target_result(zoom, crop, point, TargetKind.Point)
+end
 
-    return { crop = crop, raw_center = mouse, clamped_center = { x = math.floor(crop.x + crop.w * 0.5), y = math.floor(crop.y + crop.h * 0.5) } }
+function get_rect_target_position(zoom, target)
+    if target == nil or target.w == nil or target.h == nil or target.w <= 0 or target.h <= 0 then
+        return get_point_target_position(zoom, target)
+    end
+
+    local source_width, source_height = get_source_size(zoom)
+    local source_aspect = source_width / source_height
+    local zoom_factor = get_safe_zoom_factor(zoom)
+    local margin = target_rect_margin or 1.18
+
+    local rect_w = math.max(1, target.w or 1)
+    local rect_h = math.max(1, target.h or 1)
+    local min_w = rect_w * margin
+    local min_h = rect_h * margin
+    local crop_w = math.max(source_width / zoom_factor, min_w, min_h * source_aspect)
+
+    crop_w = clamp(1, source_width, crop_w)
+    local crop_h = crop_w / source_aspect
+
+    local anchor = {
+        x = (target.x or 0) + rect_w * 0.5,
+        y = (target.y or 0) + rect_h * 0.5,
+    }
+
+    local crop = {
+        x = anchor.x - crop_w * target_screen_x,
+        y = anchor.y - crop_h * target_screen_y,
+        w = crop_w,
+        h = crop_h,
+    }
+
+    return target_result(zoom, crop, anchor, TargetKind.Rect)
+end
+
+function get_target_position_for_target(zoom, target)
+    if target ~= nil and target.kind == TargetKind.Rect then
+        return get_rect_target_position(zoom, target)
+    end
+
+    if target ~= nil and target.kind == TargetKind.Point then
+        return get_point_target_position(zoom, target)
+    end
+
+    return get_point_target_position(zoom, nil)
+end
+
+function get_target_position(zoom)
+    return get_target_position_for_target(zoom, socket_target)
 end
 
 function on_toggle_follow(pressed)
@@ -1910,16 +2028,35 @@ function on_socket_timer()
     repeat
         local data, status = socket_server:receive_from()
         if data then
-            local sx, sy = data:match("(-?%d+) (-?%d+)")
-            if sx and sy then
-                local x = tonumber(sx, 10)
-                local y = tonumber(sy, 10)
-                if not socket_mouse then
+            local rx, ry, rw, rh = data:match("^%s*rect%s+(-?%d+)%s+(-?%d+)%s+(%d+)%s+(%d+)%s*$")
+            if rx and ry and rw and rh then
+                if socket_mouse == nil and socket_target == nil then
                     log("Socket server client connected")
-                    socket_mouse = { x = x, y = y }
-                else
-                    socket_mouse.x = x
-                    socket_mouse.y = y
+                end
+
+                socket_mouse = nil
+                socket_target = {
+                    kind = TargetKind.Rect,
+                    x = tonumber(rx, 10) or 0,
+                    y = tonumber(ry, 10) or 0,
+                    w = math.max(1, tonumber(rw, 10) or 1),
+                    h = math.max(1, tonumber(rh, 10) or 1),
+                    coordinate_space = "source",
+                }
+            else
+                local sx, sy = data:match("^%s*(-?%d+)%s+(-?%d+)%s*$")
+                if sx and sy then
+                    local x = tonumber(sx, 10)
+                    local y = tonumber(sy, 10)
+                    socket_target = nil
+
+                    if not socket_mouse then
+                        log("Socket server client connected")
+                        socket_mouse = { x = x, y = y }
+                    else
+                        socket_mouse.x = x
+                        socket_mouse.y = y
+                    end
                 end
             end
         elseif status ~= "timeout" then
@@ -1950,6 +2087,7 @@ function stop_server()
         socket_server:close()
         socket_server = nil
         socket_mouse = nil
+        socket_target = nil
     end
 end
 
@@ -2142,6 +2280,7 @@ function on_print_help()
     if socket_available then
         help = help ..
             "Enable remote mouse listener: True to start a UDP socket server that will listen for mouse position messages from a remote client, see: https://github.com/BlankSourceCode/obs-zoom-to-mouse-remote\n" ..
+            "Remote messages: send \"x y\" for a point target or \"rect x y width height\" for a source-coordinate rectangle target\n" ..
             "Port: The port number to use for the socket server\n" ..
             "Poll Delay: The time between updating the mouse position (in milliseconds)\n"
     end

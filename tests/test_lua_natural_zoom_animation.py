@@ -76,8 +76,8 @@ class NaturalZoomAnimationLuaTests(unittest.TestCase):
 
         self.assertRegex(lua, r"local\s+target_screen_x\s*=\s*0\.50")
         self.assertRegex(lua, r"local\s+target_screen_y\s*=\s*0\.45")
-        self.assertRegex(lua, r"x\s*=\s*mouse\.x\s*-\s*new_size\.width\s*\*\s*target_screen_x")
-        self.assertRegex(lua, r"y\s*=\s*mouse\.y\s*-\s*new_size\.height\s*\*\s*target_screen_y")
+        self.assertRegex(lua, r"x\s*=\s*point\.x\s*-\s*new_size\.width\s*\*\s*target_screen_x")
+        self.assertRegex(lua, r"y\s*=\s*point\.y\s*-\s*new_size\.height\s*\*\s*target_screen_y")
 
     def test_lua_exposes_cursor_coordination_controls(self):
         lua = read_lua()
@@ -111,6 +111,38 @@ class NaturalZoomAnimationLuaTests(unittest.TestCase):
         self.assertRegex(lua, r"function\s+on_timer\s*\(elapsed_ms\)[\s\S]*update_cursor_stability_delay\(elapsed_ms\)")
         self.assertIn("Cursor stable", lua)
         self.assertIn("Cursor stability wait capped", lua)
+
+    def test_lua_exposes_phase4_target_rectangle_support(self):
+        lua = read_lua()
+
+        self.assertRegex(lua, r"local\s+TargetKind\s*=\s*\{")
+        self.assertRegex(lua, r"Point\s*=\s*\"point\"")
+        self.assertRegex(lua, r"Rect\s*=\s*\"rect\"")
+        self.assertRegex(lua, r"local\s+target_rect_margin\s*=\s*1\.18")
+        self.assertRegex(lua, r"function\s+get_target_position_for_target\s*\(")
+        self.assertRegex(lua, r"function\s+get_rect_target_position\s*\(")
+        self.assertIn('coordinate_space = "source"', lua)
+        self.assertIn('data:match("^%s*rect%s+', lua)
+
+    def test_lua_target_rectangle_math_when_luajit_available(self):
+        if shutil.which("luajit") is None:
+            self.skipTest("LuaJIT is not installed on this machine")
+
+        result = subprocess.run(
+            ["luajit", "tests/obs_lua_target_rect.lua"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(
+            0,
+            result.returncode,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("OBS Lua target rectangle tests passed", result.stdout)
 
     def test_lua_has_no_merge_conflict_markers(self):
         lua = read_lua()
